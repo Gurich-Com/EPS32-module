@@ -1,0 +1,1385 @@
+/*
+ * main.c (2D_THz_scaner project)
+ *
+ *  Created on: 3 November. 2019.
+ *      Author: aleksanderberdyugin@gmail.com
+ */
+
+#include <stdio.h>
+#include <math.h>
+#include "string.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
+#include "esp_attr.h"
+#include "soc/rtc.h"
+#include "driver/mcpwm.h"
+#include "soc/mcpwm_periph.h"
+#include "soc/mcpwm_struct.h"
+#include <sys/fcntl.h>
+#include <sys/errno.h>
+#include <sys/unistd.h>
+#include <sys/select.h>
+#include "esp_vfs.h"
+#include "esp_vfs_dev.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "driver/adc.h"
+#include "driver/ledc.h"
+#include "esp_adc_cal.h"
+#include "driver/periph_ctrl.h"
+#include "esp_types.h"
+
+#define X_MCPWM          0  //Motor X MCPWM
+#define Y_MCPWM          1  //Motor Y MCPWM
+#define Z_MCPWM          2  //Motor Z MCPWM
+#define CAP0_INT_EN  BIT(27)//Capture 0 interrupt bit
+#define CAP1_INT_EN  BIT(28)//Capture 1 interrupt bit
+#define CAP2_INT_EN  BIT(29)//Capture 2 interrupt bit
+#define GPIO_CAP0_IN    36  //Set GPIO 36 as  CAP0 (X step read)
+#define GPIO_CAP1_IN    39  //Set GPIO 39 as  CAP1 (Y step read)
+#define GPIO_CAP2_IN    27  //Set GPIO 27 as  CAP2 (Z step read)
+#define GPIO_PWM0A_OUT  19  //Set GPIO 19 as PWM0A (step X)
+#define GPIO_PWM0B_OUT  18  //Set GPIO 18 as PWM0B (direction X)
+#define GPIO_PWM1A_OUT   5  //Set GPIO 5 as PWM1A (step Y)
+#define GPIO_PWM1B_OUT  17  //Set GPIO 17 as PWM1B (direction Y)
+#define GPIO_PWM2A_OUT  14  //Set GPIO 14 as PWM2A (step Z)
+#define GPIO_PWM2B_OUT  26  //Set GPIO 26 as PWM2B (direction Z)
+#define JOYSTICK_OFF   	23  //Set GPIO 23 as control Joystick off
+#define BUFFER_SIZE	    64	//Set max buffer reading data for UART
+#define DUTY_START	   50.0	//Duty for START rotate MCPWM
+#define DUTY_STOP	    0.0	//Duty for STOP rotate MCPWM
+#define DOWN_Y		   10.0	//DOWN Y direction rotate MCPWM
+#define UP_Y	  	   20.0	//UP Y direction rotate MCPWM
+#define LEFT_X		   30.0	//LEFT X direction rotate MCPWM
+#define RIGHT_X	  	   40.0	//RIGHT X direction rotate MCPWM
+#define LEFT_Z		   50.0	//LEFT Z direction rotate MCPWM
+#define RIGHT_Z	  	   60.0	//RIGHT Z direction rotate MCPWM
+#define LEFT_X_DOWN_Y  70.0	//LEFT X, DOWN Y direction rotate MCPWM
+#define RIGHT_X_UP_Y   80.0	//RIGHT X, UP Y direction rotate MCPWM
+#define LEFT_X_UP_Y    90.0 //LEFT X, RIGHT Y direction rotate MCPWM
+#define RIGHT_X_DOWN_Y 95.0 //UP Y, RIGHT X direction rotate MCPWM
+#define FREQ_X_MCPWM  3000	//set frequency X MCPWM = 3000 Hz
+#define FREQ_Y_MCPWM  1600	//set frequency Y MCPWM = 1600 Hz
+#define FREQ_Z_MCPWM 10000	//set frequency Z MCPWM = 10000 Hz
+#define BUZZ_PIN		 4  //pin for buzzer
+#define ZERO_X			16	//zero area of the X-axis
+#define ZERO_Y			15	//zero area of the Y-axis
+#define ZERO_Z_L		33	//zero area of the Z-axis left position
+#define ZERO_Z_R		25	//zero area of the Z-axis right position
+#define STEP_X_UM	12.658	//convert um X-axis to step value
+#define STEP_Y_UM	 2.015	//convert um Y-axis to step value
+#define STEP_Z_UM	0.0782	//convert um Z-axis to step value
+#define WINDOW_APROX	30  //Set the window for approximating the signal values
+#define ARRAY_SIZE	  1000	//Array massive for measurement signal data
+#define MAX_X	  	   268	//Maximum dimension X-axis mm
+#define MAX_Y	  	   230	//Maximum dimension Y-axis mm
+#define MAX_Z	  	 10000	//Maximum dimension Z-axis um
+#define AMP_MODE		11 	//Mode amplitude scanning
+#define PHASE_MODE		12  //Mode phase scanning
+
+static const char* UART = "uart", * MCPWM_TAG = "mcpwm", * PIN = "gpio", * ADC = "adc";
+
+TaskHandle_t *pxCreatedTask_X = NULL, *pxCreatedTask_Y = NULL, *pxCreatedTask_Z = NULL, *pxCreatedTask_joystick = NULL, *pxCreatedTask_scanning = NULL, *pxCreatedTask_scan_pp = NULL;
+EventGroupHandle_t mcpwm_event_group;
+static const int MCPWM_START_BIT = BIT0, MCPWM_X_ALLOW_BIT = BIT1, MCPWM_Y_ALLOW_BIT = BIT2, MCPWM_Z_ALLOW_BIT = BIT3;
+static const adc_channel_t ch1 = ADC_CHANNEL_6;     //GPIO34 if ADC1 (measurement signal)
+static const adc_channel_t ch2 = ADC2_CHANNEL_5;    //GPIO12 if ADC2 (VRX) (Joystick)
+static const adc_channel_t ch3 = ADC2_CHANNEL_4;    //GPIO13 if ADC2 (VRY) (Joystick)
+static esp_adc_cal_characteristics_t *adc_chars;
+
+typedef struct {
+    uint32_t capture_signal;
+    mcpwm_capture_signal_t sel_cap_signal;
+} capture;
+typedef struct {
+	uint32_t step_value;
+} struct_mcpwm;
+typedef struct {
+	float dir;
+	int answer;
+} arg_task_rotate;
+typedef struct {
+    int mode;
+    int st_pos_x;
+    int st_pos_y;
+    int st_pos_z;
+    int axis_x;
+    int step_x;
+    int axis_y;
+	int step_y;
+	int axis_z;
+	int step_z;
+} arg_task_scan;
+
+int position_mirror = -1;	//Current position mirror (Z-axis) /Default = -1 (unknown current position)
+xSemaphoreHandle X_step_ok_Semaphore, Y_step_ok_Semaphore, Z_step_ok_Semaphore;
+xQueueHandle cap_queue, X_step_queue, Y_step_queue, Z_step_queue;
+static mcpwm_dev_t *MCPWM[2] = { &MCPWM0, &MCPWM1 };
+
+void begin_tone(int pin, uint32_t duty, int time) {					// Tone buzzer
+	// Set LED Controller with previously prepared configuration	// number pin for buzzer, duty channel LED, time tone
+    ledc_timer_config_t ledc_timer = { .duty_resolution = LEDC_TIMER_13_BIT, .freq_hz = 5000,
+        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_1, .clk_cfg = LEDC_AUTO_CLK, };
+	ledc_timer_config(&ledc_timer);
+	ledc_channel_config_t ledc_channel[1] = { { .channel = LEDC_CHANNEL_2, .duty = 0, .gpio_num = pin,
+	          .speed_mode = LEDC_LOW_SPEED_MODE, .hpoint = 0, .timer_sel = LEDC_TIMER_1 } };
+	ledc_channel_config(&ledc_channel[0]);
+	ledc_set_duty(ledc_channel[0].speed_mode, ledc_channel[0].channel, duty);
+	ledc_update_duty(ledc_channel[0].speed_mode,ledc_channel[0].channel);
+	vTaskDelay(time / portTICK_PERIOD_MS);
+	ledc_stop(ledc_channel[0].speed_mode,ledc_channel[0].channel,0);
+}
+void allow(uint8_t pin) {                              // buzz event allow
+	begin_tone(pin, 2500, 250);
+}
+void denied(uint8_t pin) {                             // buzz event denied
+	for (int i = 0; i < 5; i++) {
+		begin_tone(pin, 2500, 70);
+		vTaskDelay(30 / portTICK_PERIOD_MS);
+	}
+}
+void succes_process(uint8_t pin) {					   //tone for success scanning process
+	for (int i = 0; i < 2; i++) {
+		begin_tone(pin, 2500, 80);
+		vTaskDelay(90 / portTICK_PERIOD_MS);
+		if(i==1) begin_tone(pin, 2500, 80);
+		vTaskDelay(90 / portTICK_PERIOD_MS);
+	}
+}
+static void captured_signal_step(void *arg) {
+	ESP_LOGI(MCPWM_TAG, "captured_signal_step start...");
+    capture evt;
+    struct_mcpwm count;
+    portBASE_TYPE xStatus_Read; BaseType_t xStatus_Send;
+    while (1) {
+        xQueueReceive(cap_queue, &evt, portMAX_DELAY);
+        if (evt.sel_cap_signal == MCPWM_SELECT_CAP0) {
+            xStatus_Read = xQueueReceive(X_step_queue, &count, (TickType_t) 10);
+            if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { /*ESP_LOGE(MCPWM_TAG, "No step X_queue!");*/ } }
+            else {
+//            	ESP_LOGI(MCPWM_TAG, "X_val: %d",  count.step_value);
+            	count.step_value--;
+				if(count.step_value == 0) {
+					if(xSemaphoreGive(X_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+					taskYIELD();
+					vTaskDelay(1);
+				} else {
+					xStatus_Send = xQueueSendToFront(X_step_queue, &count, (TickType_t) 0);
+					if(xStatus_Send != pdTRUE) { if(xStatus_Send == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data!"); }}
+				}
+            }
+        }
+        if (evt.sel_cap_signal == MCPWM_SELECT_CAP1) {
+			xStatus_Read = xQueueReceive(Y_step_queue, &count, (TickType_t) 10);
+			if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { /*ESP_LOGE(MCPWM_TAG, "No step Y_queue!");*/ } }
+			else {
+//				ESP_LOGI(MCPWM_TAG, "Y_val: %d",  count.step_value);
+				count.step_value--;
+				if(count.step_value == 0) {
+					if(xSemaphoreGive(Y_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+					taskYIELD();
+					vTaskDelay(1);
+				} else {
+					xStatus_Send = xQueueSendToFront(Y_step_queue, &count, (TickType_t) 0);
+					if(xStatus_Send != pdTRUE) { if(xStatus_Send == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data!"); }}
+				}
+			}
+		}
+        if (evt.sel_cap_signal == MCPWM_SELECT_CAP2) {
+			xStatus_Read = xQueueReceive(Z_step_queue, &count, (TickType_t) 10);
+			if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { /*ESP_LOGE(MCPWM_TAG, "No step Z_queue!");*/ } }
+			else {
+//				ESP_LOGI(MCPWM_TAG, "Z_val: %d",  count.step_value);
+				count.step_value--;
+				if(count.step_value == 0) {
+					if(xSemaphoreGive(Z_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+					taskYIELD();
+					vTaskDelay(1);
+				} else {
+					xStatus_Send = xQueueSendToFront(Z_step_queue, &count, (TickType_t) 0);
+					if(xStatus_Send != pdTRUE) { if(xStatus_Send == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data!"); }}
+				}
+			}
+		}
+    }
+}
+static void IRAM_ATTR isr_handler_cap(void *arg) {
+    uint32_t mcpwm_intr_status;
+    capture evt;
+    mcpwm_intr_status = MCPWM[MCPWM_UNIT_0]->int_st.val; //Read interrupt status
+    if (mcpwm_intr_status & CAP0_INT_EN) { //Check for interrupt on rising edge on CAP0 signal
+        evt.capture_signal = mcpwm_capture_signal_get_value(MCPWM_UNIT_0, MCPWM_SELECT_CAP0); //get capture signal counter value
+        evt.sel_cap_signal = MCPWM_SELECT_CAP0;
+        xQueueSendFromISR(cap_queue, &evt, ( TickType_t ) 0);
+    }
+    if (mcpwm_intr_status & CAP2_INT_EN) { //Check for interrupt on rising edge on CAP1 signal
+    		evt.capture_signal = mcpwm_capture_signal_get_value(MCPWM_UNIT_0, MCPWM_SELECT_CAP2); //get capture signal counter value
+    		evt.sel_cap_signal = MCPWM_SELECT_CAP2;
+    		xQueueSendFromISR(cap_queue, &evt, ( TickType_t ) 0);
+    	}
+    if (mcpwm_intr_status & CAP1_INT_EN) { //Check for interrupt on rising edge on CAP1 signal
+		evt.capture_signal = mcpwm_capture_signal_get_value(MCPWM_UNIT_0, MCPWM_SELECT_CAP1); //get capture signal counter value
+		evt.sel_cap_signal = MCPWM_SELECT_CAP1;
+		xQueueSendFromISR(cap_queue, &evt, ( TickType_t ) 0);
+	}
+    MCPWM[MCPWM_UNIT_0]->int_clr.val = mcpwm_intr_status;
+}
+int string_to_number(const char* str) {
+	int result = 0;
+	result = atoi(str);
+	return result;
+}// cut out of array char value transform to integer
+bool shift_and_verify_string_number(char* str, int shift) {
+	for(int i = 0; i < strlen(str); i++)
+	{
+		str[i] = str[i+shift]; 					//string left shift by 'shift' symbol
+		if(i == strlen(str)) { break; }
+		if(((str[i] < '0')||(str[i] > '9')) && (str[i] != '\n')) { return false; }
+	}
+	return true;
+} //verify number value step, if value not correct then return error
+void shift_string(char* str, int shift) {
+	for(int i = 0; i < strlen(str); i++) {
+		str[i] = str[i+shift];
+	}		//string left shift by 'SHIFT' symbol
+}
+int search_slash_convert_num(char* str) {
+	char str_temp[64] = "";
+	char *ptr=strchr(str,'/');
+	if(ptr-str < 0) {return -1;}
+	strncpy(str_temp, str, ptr-str);	//copy the first number (to symbol /) from a string and shift by its length
+	if(false == shift_and_verify_string_number(str_temp,0)) {return -13;}
+	shift_string(str, (ptr-str)+1);
+	return string_to_number(str_temp);	//verify and convert to integer
+}
+
+int gpio_control_pin(char *str, gpio_mode_t mode, int value) {
+	shift_and_verify_string_number(str, 4);		//string verify and left shift by 4 symbol (pin:)
+	if(!strncmp(str,"error",5)) { return -1; }	//if value not correct then return error= -1
+	int number_pin = string_to_number(str);		//what pin number?
+	ESP_LOGI(PIN, "PIN: %i", number_pin);
+	switch(mode) {
+	case GPIO_MODE_DISABLE:  	//mode reading gpio
+		if(((number_pin>=0)&&(number_pin!=20)&&(number_pin!=24)&&(number_pin<=27))||((number_pin>=32)&&(number_pin<=39))) {}
+		else { ESP_LOGE(PIN, "failed reading pin: %s", str); return -5; }
+		value = gpio_get_level(number_pin);
+		if(value < 0) { ESP_LOGE(PIN, "failed reading pin: %s", str); }
+		ESP_LOGI(PIN, "PIN value read: %i", value);
+		return value;
+	case GPIO_MODE_OUTPUT: 		//mode output gpio
+		if((number_pin==2)||(number_pin==5)||(number_pin==12)||(number_pin==13)||
+			(number_pin==21)||(number_pin==25)||(number_pin==32)||(number_pin==33)) {}
+		else { ESP_LOGE(PIN, "failed set output high pin: %s", str); return -5; }
+		gpio_set_direction(number_pin, GPIO_MODE_OUTPUT);	//set gpio output mode
+		gpio_set_level(number_pin, value);						//set gpio HIGH level output gpio
+		break;
+	case GPIO_MODE_INPUT:  		//mode input gpio
+		if((number_pin==2)||(number_pin==5)||(number_pin==12)||(number_pin==13)||(number_pin==21)||(number_pin==25)||
+			(number_pin==32)||(number_pin==33)||(number_pin==35)||(number_pin==36)||(number_pin==39)) {}
+		else { ESP_LOGE(PIN, "failed set input pin: %s", str); return -5; }
+		gpio_set_direction(number_pin, GPIO_MODE_INPUT);		//set gpio input mode
+		break;
+	default:
+		ESP_LOGE(PIN, "no such mode gpio: %s", str);
+		return -4;
+	}
+	return 1;
+}
+int command_gpio(char *str) {
+	shift_string(str, 5);		//string left shift by 5 symbol
+	if(!strncmp(str,"read/",5))	{	//which mode gpio? reading mode?
+		shift_string(str, 5);		//string left shift by 5 symbol
+		int read_value = gpio_control_pin(str, GPIO_MODE_DISABLE, 0);	//reading digital value pin
+		if(read_value < 0) { ESP_LOGE(PIN, "failed reading pin: %s", str); return read_value; }
+	} else if(!strncmp(str,"out/",4))	{	//which mode gpio? output mode?
+		shift_string(str, 4);		//string left shift by 4 symbol
+		if(!strncmp(str,"high/",5))	{	//which output mode? high?
+			shift_string(str, 5);		//string left shift by 5 symbol
+			return gpio_control_pin(str, GPIO_MODE_OUTPUT, pdTRUE);			//set HIGH value pin
+		} else if(!strncmp(str,"low/",4))	{	//which output mode? low?
+			shift_string(str, 4);		//string left shift by 4 symbol
+			return gpio_control_pin(str, GPIO_MODE_OUTPUT, pdFALSE);		//set LOW value pin
+		} else { ESP_LOGE(PIN, "no such output mode gpio: %s", str); return -3; } //error= -3 (no such output mode gpio)
+	} else if(!strncmp(str,"in/",3))	{	//which mode gpio? input mode?
+		shift_string(str, 3);		//string left shift by 3 symbol
+		if(!strncmp(str,"pin:",4))	{	//which command gpio? pin?
+			return gpio_control_pin(str, GPIO_MODE_INPUT, 0);			//set INPUT direction pin
+		} else { ESP_LOGE(PIN, "no such command gpio: %s", str); return -3; } //error= -3 (no such command gpio)
+	} else { ESP_LOGE(PIN, "no such mode gpio: %s", str); return -3; } //error= -3 (no such mode gpio)
+	return 1;				//Command completed
+}
+int reading_adc1_one(void) {
+	int adc_reading = 0;
+	adc_reading = adc1_get_raw((adc1_channel_t)ch1);
+	ESP_LOGI(ADC,"Raw: %d", adc_reading);
+	return adc_reading;
+}
+int reading_adc1_period(char *str) {
+	if(false == shift_and_verify_string_number(str, 7)) {return -1;} //string verify and left shift by 7 symbol
+	int *ptr_adc_val; int size_massiv = string_to_number(str);
+	ptr_adc_val = (int*)malloc(size_massiv * sizeof(int));
+	if (ptr_adc_val == NULL) { ESP_LOGE(ADC, "failed create dynamic massive"); return -11; }
+	for (int i = 0; i < size_massiv; i++) {
+		ptr_adc_val[i] = adc1_get_raw((adc1_channel_t)ch1);
+		if(ptr_adc_val[i] == -1) { ESP_LOGE(ADC, "failed reading ADC"); return -12; }
+	}
+	for (int n = 0; n < size_massiv; n++) { ESP_LOGI(ADC,"	%d	%d", n, ptr_adc_val[n]); }
+	free(ptr_adc_val);
+	return 1;
+}
+void getApprox(int *a, int *b, int n, int step, int *signals) {
+  int sumx = 0, sumy = 0; double sumx2 = 0, sumxy = 0;
+  for (int i = n; i < n+step; i++) {
+    sumx += i;
+    sumy += signals[i];
+    sumx2 += i * i;
+    sumxy += i * signals[i];
+  }
+  *a = (step*sumxy - (sumx*sumy)) / (step*sumx2 - sumx*sumx);
+  *b = (sumy - *a*sumx) / step;
+  return;
+}
+int reading_adc1_smooth_max_period(void) {
+	int a, b, max_sign = 0;
+	int *signals; signals = (int*)malloc(ARRAY_SIZE * sizeof(int));					//Memory allocation
+	if (signals == NULL) { ESP_LOGE(ADC, "failed create dynamic massive"); return -11; }
+	for (int i = 0; i < ARRAY_SIZE; i++) { signals[i] = adc1_get_raw((adc1_channel_t)ch1); }
+	for (int i = 0, step = WINDOW_APROX; i < ARRAY_SIZE; i+=step) {
+		if(ARRAY_SIZE-i < WINDOW_APROX) step = ARRAY_SIZE-i;
+		getApprox(&a, &b, i, step, signals);										//Approximation
+		for (int n = i; n < i+step; n++) { signals[n] = a*n + b; }
+	}//for (int i = 0; i<ARRAY_SIZE; i++) ESP_LOGI(ADC,"%d : %d", i, signals[i]);	// Testing Approximation
+	for (int n = 0; n < ARRAY_SIZE; n++) { if(signals[n] > max_sign) { max_sign =  signals[n]; } }
+	free(signals); 																	//Clear memory
+//	if(max_sign > 3300) max_sign = 3333;
+	return max_sign;
+}
+int command_adc(char *str) {
+	shift_string(str, 4);		//string left shift by 4 symbol
+	if(!strncmp(str,"one",3))	{	//reading mode? one sampling reading adc
+		int read_value = reading_adc1_one();
+		if(read_value < 0) { ESP_LOGE(ADC, "failed reading adc one: %s", str); return read_value; }
+	} else if(!strncmp(str,"sm_max",6))	{	//reading mode? reading smooth periodic signals and search MAX
+		int max_sign = reading_adc1_smooth_max_period();
+		if(max_sign < 0) return max_sign;
+		else { ESP_LOGI("Max","%d", max_sign); return 1; }
+	} else if(!strncmp(str,"period:",7))	{	//reading mode? periodic reading adc
+		return reading_adc1_period(str);
+	} else {ESP_LOGE(ADC, "no such mode read adc: %s", str); return -4;}
+	return 1;				//Command completed
+}
+int reading_status(char *str) {
+	const char *STATUS = "status";
+	shift_string(str, 7);		//string left shift by 7 symbol
+	if(!strncmp(str,"mcpwm/",6))	{	//which status bit? mcpwm?
+		shift_string(str, 6);		//string left shift by 6 symbol
+		if(!strncmp(str,"start",5))	{	//which status? start bit?
+			EventBits_t uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0);
+			if((uxBits & MCPWM_START_BIT) != 0) { ESP_LOGI(STATUS, "MCPWM_START_BIT = SET"); }
+			else { ESP_LOGI(STATUS, "MCPWM_START_BIT = CLEAR"); }
+		} else if(!strncmp(str,"allow",5))	{	//which status? allow bit?
+			shift_string(str, 5);		//string left shift by 5 symbol
+			EventBits_t uxBits;
+			if(!strncmp(str,":x",2))	{	//which status? allow mcpwm X bit?
+				uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, (TickType_t) 0);
+				if((uxBits & MCPWM_X_ALLOW_BIT) != 0) { ESP_LOGI(STATUS, "MCPWM_X_ALLOW_BIT = SET"); }
+				else { ESP_LOGI(STATUS, "MCPWM_X_ALLOW_BIT = CLEAR"); }
+			} else if(!strncmp(str,":y",2))	{	//which status? allow mcpwm Y bit?
+				uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0);
+				if((uxBits & MCPWM_Y_ALLOW_BIT) != 0) { ESP_LOGI(STATUS, "MCPWM_Y_ALLOW_BIT = SET"); }
+				else { ESP_LOGI(STATUS, "MCPWM_Y_ALLOW_BIT = CLEAR"); }
+			} else {
+				uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0);
+				if((uxBits & (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT)) == (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT)) {
+					ESP_LOGI(STATUS, "MCPWM_Y_ALLOW_BIT and MCPWM_X_ALLOW_BIT = SET");
+				} else if( ( uxBits & MCPWM_X_ALLOW_BIT ) != 0 ) {
+					ESP_LOGI(STATUS, "MCPWM_X_ALLOW_BIT = SET, MCPWM_Y_ALLOW_BIT = CLEAR");
+				} else if( ( uxBits & MCPWM_Y_ALLOW_BIT ) != 0 ) {
+					ESP_LOGI(STATUS, "MCPWM_Y_ALLOW_BIT = SET, MCPWM_X_ALLOW_BIT = CLEAR");
+				} else {
+					ESP_LOGI(STATUS, "MCPWM_Y_ALLOW_BIT and MCPWM_X_ALLOW_BIT = CLEAR");
+				}
+			}
+		} else if(!strncmp(str,"queue",5))	{	//which data in queue?
+			struct_mcpwm count;
+			portBASE_TYPE xStatus_Read = xQueuePeek(X_step_queue, &count, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { ESP_LOGI(STATUS, "X_step(queue) = NO DATA"); } }
+			else { ESP_LOGI(STATUS, "X_step(queue) = %d", count.step_value); }
+			xStatus_Read = xQueuePeek(Y_step_queue, &count, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { ESP_LOGI(STATUS, "Y_step(queue) = NO DATA"); } }
+			else { ESP_LOGI(STATUS, "Y_step(queue) = %d", count.step_value); }
+		} else { ESP_LOGE(STATUS, "no such status: %s", str); return -3; } //error= -3 (no such status bit)
+	}
+	return 1;
+}
+
+static void task_rotate_X_MCPWM(void *arg) {
+	struct_mcpwm count;
+	char *direction = "";
+	volatile arg_task_rotate *px_arg; px_arg = (arg_task_rotate *) arg;
+	portBASE_TYPE xStatus_X = xQueuePeek(X_step_queue, &count, (TickType_t) 0);	//reading step_X data
+	if(xStatus_X != pdPASS) {if(xStatus_X == errQUEUE_EMPTY) {ESP_LOGE(MCPWM_TAG, "No data X_step_queue!"); direction = (char*)"No rotate X_MCPWM.";}}
+	else {
+		xEventGroupClearBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT);	//clear flag ALLOW
+		if(px_arg->dir == LEFT_X) {mcpwm_set_signal_high(MCPWM_UNIT_0, X_MCPWM, MCPWM_OPR_B); direction=(char*)"LEFT";}
+		else if(px_arg->dir == RIGHT_X) {mcpwm_set_signal_low(MCPWM_UNIT_0, X_MCPWM, MCPWM_OPR_B); direction=(char*)"RIGHT";}
+		else if(px_arg->dir == 0) {direction = (char*)"RESUME";} else {ESP_LOGE(MCPWM_TAG, "Fail: %f", px_arg->dir); }
+//		ESP_LOGI(MCPWM_TAG, "X step: %d go dir: %s", count.step_value, direction);
+		mcpwm_set_duty(MCPWM_UNIT_0, X_MCPWM, MCPWM_OPR_A, DUTY_START); 	//Rotated MCPWM start
+		if(pdFALSE == xSemaphoreTake(X_step_ok_Semaphore, 100000 / portTICK_PERIOD_MS)) 	//Waiting up Semaphore X
+			{ESP_LOGE(MCPWM_TAG, "Timeout take Semaphore (100 second)");}				//Timeout waiting
+		mcpwm_set_duty(MCPWM_UNIT_0, X_MCPWM, MCPWM_OPR_A, DUTY_STOP); 	//Rotated MCPWM stop
+		xQueueReset(X_step_queue);										//Reset data step_queue
+		xEventGroupSetBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT);		//set flag ALLOW
+	}
+	if(px_arg->answer == 1) { ESP_LOGI(MCPWM_TAG, "completed rotate X - %s", direction); }
+	vTaskDelete(NULL);
+}
+static void task_rotate_Y_MCPWM(void *arg) {
+	struct_mcpwm count;
+	char *direction = "";
+	volatile arg_task_rotate *px_arg; px_arg = (arg_task_rotate *) arg;
+	portBASE_TYPE xStatus_Y = xQueuePeek(Y_step_queue, &count, (TickType_t) 0);	//reading step_Y data
+	if(xStatus_Y != pdPASS) {if(xStatus_Y == errQUEUE_EMPTY) {ESP_LOGE(MCPWM_TAG, "No data Y_step_queue!"); direction=(char*)"No rotate Y_MCPWM.";}}
+	else {
+		xEventGroupClearBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT);	//clear flag ALLOW
+		if(px_arg->dir == DOWN_Y) {mcpwm_set_signal_high(MCPWM_UNIT_0, Y_MCPWM, MCPWM_OPR_B); direction=(char*)"DOWN";}
+		else if(px_arg->dir == UP_Y) {mcpwm_set_signal_low(MCPWM_UNIT_0, Y_MCPWM, MCPWM_OPR_B); direction=(char*)"UP";}
+		else if(px_arg->dir == 0) {direction = (char*)"RESUME";} else {ESP_LOGE(MCPWM_TAG, "Fail: %f", px_arg->dir); }
+//		ESP_LOGI(MCPWM_TAG, "Y step: %d go dir: %s", count.step_value, direction);
+		mcpwm_set_duty(MCPWM_UNIT_0, Y_MCPWM, MCPWM_OPR_A, DUTY_START); 	//Rotated MCPWM start
+		if(pdFALSE == xSemaphoreTake(Y_step_ok_Semaphore, 100000 / portTICK_PERIOD_MS)) 	//Waiting up Semaphore
+			{ESP_LOGE(MCPWM_TAG, "Timeout take Semaphore (100 second)");}				//Timeout waiting
+		mcpwm_set_duty(MCPWM_UNIT_0, Y_MCPWM, MCPWM_OPR_A, DUTY_STOP); 	//Rotated MCPWM stop
+		xQueueReset(Y_step_queue);										//Reset data step_queue
+		xEventGroupSetBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT);			//set flag ALLOW
+	}
+	if(px_arg->answer == 1) { ESP_LOGI(MCPWM_TAG, "completed rotate Y - %s", direction); }
+	vTaskDelete(NULL);
+}
+static void task_rotate_Z_MCPWM(void *arg) {
+	struct_mcpwm count;
+	char *direction = "";
+	volatile arg_task_rotate *px_arg; px_arg = (arg_task_rotate *) arg;
+	portBASE_TYPE xStatus_Z = xQueuePeek(Z_step_queue, &count, (TickType_t) 0);	//reading step_Z data
+	if(xStatus_Z != pdPASS) {if(xStatus_Z == errQUEUE_EMPTY) {ESP_LOGE(MCPWM_TAG, "No data Z_step_queue!"); direction=(char*)"No rotate Z_MCPWM.";}}
+	else {
+		xEventGroupClearBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT);	//clear flag ALLOW
+		if(px_arg->dir == LEFT_Z) {mcpwm_set_signal_low(MCPWM_UNIT_0, Z_MCPWM, MCPWM_OPR_B); direction=(char*)"LEFT";}
+		else if(px_arg->dir == RIGHT_Z) {mcpwm_set_signal_high(MCPWM_UNIT_0, Z_MCPWM, MCPWM_OPR_B); direction=(char*)"RIGHT";}
+		else if(px_arg->dir == 0) {direction = (char*)"RESUME";} else {ESP_LOGE(MCPWM_TAG, "Fail: %f", px_arg->dir); }
+//		ESP_LOGI(MCPWM_TAG, "Z step: %d go dir: %s", count.step_value, direction);
+		mcpwm_set_duty(MCPWM_UNIT_0, Z_MCPWM, MCPWM_OPR_A, DUTY_START); 	//Rotated MCPWM start
+		if(pdFALSE == xSemaphoreTake(Z_step_ok_Semaphore, 300000 / portTICK_PERIOD_MS)) 	//Waiting up Semaphore
+			{ESP_LOGE(MCPWM_TAG, "Timeout take Semaphore (300 second)");}				//Timeout waiting
+		mcpwm_set_duty(MCPWM_UNIT_0, Z_MCPWM, MCPWM_OPR_A, DUTY_STOP); 	//Rotated MCPWM stop
+		xQueueReset(Z_step_queue);										//Reset data step_queue
+		xEventGroupSetBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT);			//set flag ALLOW
+	}
+	if(px_arg->answer == 1) { ESP_LOGI(MCPWM_TAG, "completed rotate Z - %s", direction); }
+	vTaskDelete(NULL);
+}
+int rotate_one_mcpwm(arg_task_rotate *arg, int step) {
+	BaseType_t xStatus;	struct_mcpwm count;
+	static arg_task_rotate val_task; val_task.dir = arg->dir; val_task.answer = arg->answer;
+	if(step <= 0) {return -1;}							//correct step?
+	if(val_task.dir >= LEFT_Z) {						//what direction to go? Z-axis
+		if((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+			count.step_value = (uint32_t)roundf(step / STEP_Z_UM); 					//how many steps to go? (conversion to MCPWM steps)
+			xStatus = xQueueSendToFront(Z_step_queue, &count, (TickType_t) 0);	//send to Z_step_queue step data
+			if(xStatus != pdTRUE) { if(xStatus == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data Z!"); xQueueReset(Z_step_queue); return -8; }}
+			else {	xTaskCreatePinnedToCore(task_rotate_Z_MCPWM, "task_rotate_Z_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_Z, 1); }
+		} else { /*ESP_LOGE(MCPWM_TAG, "mcpwm Z busy!");*/ return -6; }		//if no set flag ALLOW
+	} else {
+		if(val_task.dir <= UP_Y) {						//what direction to go? Y-axis
+			if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+				count.step_value = (uint32_t)roundf(step / STEP_Y_UM); 					//how many steps to go? (conversion to MCPWM steps)
+				xStatus = xQueueSendToFront(Y_step_queue, &count, (TickType_t) 0);	//send to Y_step_queue step data
+				if(xStatus != pdTRUE) { if(xStatus == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data Y!"); xQueueReset(Y_step_queue); return -8; }}
+				else { xTaskCreatePinnedToCore(task_rotate_Y_MCPWM, "task_rotate_Y_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_Y, 1); }
+			} else { /*ESP_LOGE(MCPWM_TAG, "mcpwm Y busy!");*/ return -6; }		//if no set flag ALLOW
+		} else {										//what direction to go? X-axis
+			if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+				count.step_value = (uint32_t)roundf(step / STEP_X_UM); 					//how many steps to go? (conversion to MCPWM steps)
+				xStatus = xQueueSendToFront(X_step_queue, &count, (TickType_t) 0); 	//send to X_step_queue step data
+				if(xStatus != pdTRUE) { if(xStatus == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data X!"); xQueueReset(X_step_queue); return -8; }}
+				else { xTaskCreatePinnedToCore(task_rotate_X_MCPWM, "task_rotate_X_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_X, 1); }
+			} else { /*ESP_LOGE(MCPWM_TAG, "mcpwm X busy!");*/ return -6; }		//if no set flag ALLOW
+		}
+	}
+	return 1;
+}
+int rotate_two_mcpwm(arg_task_rotate *arg, int step_x, int step_y) {
+	BaseType_t xStatus_X, xStatus_Y; struct_mcpwm count_y, count_x; static arg_task_rotate val_task_x, val_task_y;
+	val_task_x.answer = arg->answer; val_task_y.answer = arg->answer;
+	if(step_x <= 0) {return -1;} if(step_y <= 0) {return -1;}	//correct step?
+	count_x.step_value = (uint32_t)roundf(step_x / STEP_X_UM); 		//how many steps to go? (conversion to MCPWM steps);
+	count_y.step_value = (uint32_t)roundf(step_y / STEP_Y_UM); 		//how many steps to go? (conversion to MCPWM steps);
+	if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {}
+	else { ESP_LOGE(MCPWM_TAG, "mcpwm X busy!"); return -6; }		//if no set flag ALLOW
+	if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {}
+	else { ESP_LOGE(MCPWM_TAG, "mcpwm Y busy!"); return -6; }		//if no set flag ALLOW
+	xStatus_X = xQueueSendToFront(X_step_queue, &count_x, (TickType_t) 0);	//send to X_step_queue step data
+	if(xStatus_X != pdTRUE) { if(xStatus_X == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data X!"); return -8; }}
+	xStatus_Y = xQueueSendToFront(Y_step_queue, &count_y, (TickType_t) 0);	//send to Y_step_queue step data
+	if(xStatus_Y != pdTRUE) { if(xStatus_Y == errQUEUE_FULL) { ESP_LOGE(MCPWM_TAG, "Error sending data Y!"); return -8; }}
+	if(arg->dir <= RIGHT_X_UP_Y) {
+		if(arg->dir == RIGHT_X_UP_Y) { val_task_x.dir = RIGHT_X; val_task_y.dir = UP_Y; } else { val_task_x.dir = LEFT_X; val_task_y.dir = DOWN_Y; }
+	} else {
+		if(arg->dir == RIGHT_X_DOWN_Y) { val_task_x.dir = RIGHT_X; val_task_y.dir = DOWN_Y; } else { val_task_x.dir = LEFT_X; val_task_y.dir = UP_Y; }
+	}
+	xTaskCreatePinnedToCore(task_rotate_X_MCPWM, "task_rotate_X_MCPWM", 4096, &val_task_x, 5, (TaskHandle_t *const)&pxCreatedTask_X, 1);
+	xTaskCreatePinnedToCore(task_rotate_Y_MCPWM, "task_rotate_Y_MCPWM", 4096, &val_task_y, 5, (TaskHandle_t *const)&pxCreatedTask_Y, 1);
+	return 1;
+}
+int rotate_mcpwm(char *str) {
+	static arg_task_rotate val_task; int one = 0, two = 0; val_task.answer = 1;
+	if(!strncmp(str,"zleft:",6))	{val_task.dir = LEFT_Z; if(false == shift_and_verify_string_number(str, 6)) {return -1;} one = string_to_number(str);}
+	else if(!strncmp(str,"zright:",7))	{val_task.dir = RIGHT_Z; if(false == shift_and_verify_string_number(str, 7)) {return -1;} one = string_to_number(str);}
+	else if(!strncmp(str,"left:",5))	{val_task.dir = LEFT_X; if(false == shift_and_verify_string_number(str, 5)) {return -1;} one = string_to_number(str);}
+	else if(!strncmp(str,"down:",5))	{val_task.dir = DOWN_Y; if(false == shift_and_verify_string_number(str, 5)) {return -1;} one = string_to_number(str);}
+	else if(!strncmp(str,"right:",6))	{val_task.dir = RIGHT_X; if(false == shift_and_verify_string_number(str, 6)) {return -1;} one = string_to_number(str);}
+	else if(!strncmp(str,"up:",3))  {val_task.dir = UP_Y; if(false == shift_and_verify_string_number(str, 3)) {return -1;} one = string_to_number(str);}
+	else if(!strncmp(str,"left/down:",10))	{val_task.dir = LEFT_X_DOWN_Y; shift_string(str, 10); one = search_slash_convert_num(str); if(one < 0) return one; two = search_slash_convert_num(str); if(two < 0) return two;}
+	else if(!strncmp(str,"right/up:",9)) {val_task.dir = RIGHT_X_UP_Y; shift_string(str, 9); one = search_slash_convert_num(str); if(one < 0) return one; two = search_slash_convert_num(str); if(two < 0) return two;}
+	else if(!strncmp(str,"left/up:",8)) {val_task.dir = LEFT_X_UP_Y; shift_string(str, 8); one = search_slash_convert_num(str); if(one < 0) return one; two = search_slash_convert_num(str); if(two < 0) return two;}
+	else if(!strncmp(str,"right/down:",11)) {val_task.dir = RIGHT_X_DOWN_Y; shift_string(str, 11); one = search_slash_convert_num(str); if(one < 0) return one; two = search_slash_convert_num(str); if(two < 0) return two;}
+	else { ESP_LOGE(MCPWM_TAG, "no such command mcpwm: %s", str); return -3; } //error= -3 (no such command mcpwm)str
+	if(val_task.dir <= RIGHT_Z) {return rotate_one_mcpwm(&val_task, one);}
+	else if(val_task.dir <= RIGHT_X_DOWN_Y) {return rotate_two_mcpwm(&val_task, one, two);}
+	else { ESP_LOGE(MCPWM_TAG, "Fail rotating. Unknown direction. Data: %f", val_task.dir); return -9; }
+	return 1;
+}
+int pause_rotate(char *sel_str) {
+	char two_str[9] = "";
+	shift_string(sel_str, 5);		//string left shift by 5 symbol
+	EventBits_t uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0);
+	if(!strncmp(sel_str,":z",2))	{
+		if(( uxBits & MCPWM_Z_ALLOW_BIT ) == 0) {
+			mcpwm_set_duty(MCPWM_UNIT_0, Z_MCPWM, MCPWM_OPR_A, DUTY_STOP); 		//Rotated Z_MCPWM pause
+			xEventGroupSetBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT);		//set flag ALLOW
+			if (pxCreatedTask_Z != NULL) {
+				vTaskDelete(pxCreatedTask_Z); pxCreatedTask_Z = NULL; strcpy(sel_str, "Z_MCPWM");		//delete create action task
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. no task!"); return -5; }
+		} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm Z no rotate!"); return -6; }		//if no set flag ALLOW
+	} else if(!strncmp(sel_str,":x",2))	{
+		if(( uxBits & MCPWM_X_ALLOW_BIT ) == 0) {
+			mcpwm_set_duty(MCPWM_UNIT_0, X_MCPWM, MCPWM_OPR_A, DUTY_STOP); 		//Rotated X_MCPWM pause
+			xEventGroupSetBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT);		//set flag ALLOW
+			if (pxCreatedTask_X != NULL) {
+				vTaskDelete(pxCreatedTask_X); pxCreatedTask_X = NULL; strcpy(sel_str, "X_MCPWM");		//delete create action task
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. no task!"); return -5; }
+		} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm X no rotate!"); return -6; }		//if no set flag ALLOW
+	} else if(!strncmp(sel_str,":y",2))	{
+		if(( uxBits & MCPWM_Y_ALLOW_BIT ) == 0) {
+			mcpwm_set_duty(MCPWM_UNIT_0, Y_MCPWM, MCPWM_OPR_A, DUTY_STOP); 		//Rotated Y_MCPWM pause
+			xEventGroupSetBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT);		//set flag ALLOW
+			if (pxCreatedTask_Y != NULL) {
+				vTaskDelete(pxCreatedTask_Y); pxCreatedTask_Y = NULL; strcpy(sel_str, "Y_MCPWM");		//delete create action task
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. no task!"); return -5; }
+		} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm Y no rotate!"); return -6; }		//if no set flag ALLOW
+	} else {
+		if(( uxBits & MCPWM_Z_ALLOW_BIT ) == 0) {
+			mcpwm_set_duty(MCPWM_UNIT_0, Z_MCPWM, MCPWM_OPR_A, DUTY_STOP); 		//Rotated Z_MCPWM pause
+			xEventGroupSetBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT);		//set flag ALLOW
+			if (pxCreatedTask_Z != NULL) {
+				vTaskDelete(pxCreatedTask_Z); pxCreatedTask_Z = NULL; strcpy(sel_str, "Z_MCPWM");		//delete create action task
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. no task!"); return -5; }
+		} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm Z no rotate!"); strcpy(sel_str, "");}		//if no set flag ALLOW
+		if(( uxBits & MCPWM_X_ALLOW_BIT ) == 0) {
+			mcpwm_set_duty(MCPWM_UNIT_0, X_MCPWM, MCPWM_OPR_A, DUTY_STOP); 		//Rotated X_MCPWM pause
+			xEventGroupSetBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT);		//set flag ALLOW
+			if (pxCreatedTask_X != NULL) {
+				vTaskDelete(pxCreatedTask_X); pxCreatedTask_X = NULL; strcpy(sel_str, "X_MCPWM");		//delete create action task
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. no task!"); return -5; }
+		} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm X no rotate!"); strcpy(sel_str, "");}//if no set flag ALLOW
+		if(( uxBits & MCPWM_Y_ALLOW_BIT ) == 0) {
+			mcpwm_set_duty(MCPWM_UNIT_0, Y_MCPWM, MCPWM_OPR_A, DUTY_STOP); 		//Rotated Y_MCPWM pause
+			xEventGroupSetBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT);		//set flag ALLOW
+			if (pxCreatedTask_Y != NULL) {
+				vTaskDelete(pxCreatedTask_Y); pxCreatedTask_Y = NULL; strcpy(sel_str, "Y_MCPWM");		//delete create action task
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. no task!"); return -5; }
+		} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm Y no rotate!"); }		//if no set flag ALLOW
+	}
+	if(((uxBits & (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT)) == 0) || (( uxBits & MCPWM_X_ALLOW_BIT ) == 0)
+			|| (( uxBits & MCPWM_Y_ALLOW_BIT ) == 0) || (( uxBits & MCPWM_Z_ALLOW_BIT ) == 0)) {
+		ESP_LOGI(MCPWM_TAG, "PAUSE rotate %s %s", sel_str, two_str);
+	} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm X,Y,Z no rotate!"); return -6; }		//if no set flag ALLOW
+	return 1;
+}
+int stop_rotate(void) {
+	esp_err_t ret;
+	if((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+		ret = mcpwm_stop(MCPWM_UNIT_0, Z_MCPWM); 						//X_MCPWM stop
+		if(ret != ESP_OK) {if(ret == ESP_ERR_INVALID_ARG) { ESP_LOGE(MCPWM_TAG, "Fail STOP Z_MCPWM. Error invalid argument"); return -9; }}
+	} else { ESP_LOGE(MCPWM_TAG, "Fail STOP. first set to pause mcpwm Z!"); return -6; }		//if no set flag ALLOW
+	if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+		ret = mcpwm_stop(MCPWM_UNIT_0, X_MCPWM); 						//X_MCPWM stop
+		if(ret != ESP_OK) {if(ret == ESP_ERR_INVALID_ARG) { ESP_LOGE(MCPWM_TAG, "Fail STOP X_MCPWM. Error invalid argument"); return -9; }}
+	} else { ESP_LOGE(MCPWM_TAG, "Fail STOP. first set to pause mcpwm X!"); return -6; }		//if no set flag ALLOW
+	if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+		ret = mcpwm_stop(MCPWM_UNIT_0, Y_MCPWM); 						//Y_MCPWM stop
+		if(ret != ESP_OK) {if(ret == ESP_ERR_INVALID_ARG) { ESP_LOGE(MCPWM_TAG, "Fail STOP Y_MCPWM. Error invalid argument"); return -9; }}
+	} else { ESP_LOGE(MCPWM_TAG, "Fail STOP. first set to pause mcpwm Y!"); return -6; }		//if no set flag ALLOW
+	xEventGroupClearBits(mcpwm_event_group, MCPWM_START_BIT);		//clear flag START
+	ESP_LOGI(MCPWM_TAG, "STOP mcpwm");
+	return 1;
+}
+int start_rotate(void) {
+	esp_err_t ret;
+	ret = mcpwm_start(MCPWM_UNIT_0, Z_MCPWM); 							//X_MCPWM start
+	if(ret != ESP_OK) {if(ret == ESP_ERR_INVALID_ARG) { ESP_LOGE(MCPWM_TAG, "Fail START Z_MCPWM. Error invalid argument"); return -9; }}
+	ret = mcpwm_start(MCPWM_UNIT_0, X_MCPWM); 							//X_MCPWM start
+	if(ret != ESP_OK) {if(ret == ESP_ERR_INVALID_ARG) { ESP_LOGE(MCPWM_TAG, "Fail START X_MCPWM. Error invalid argument"); return -9; }}
+	ret = mcpwm_start(MCPWM_UNIT_0, Y_MCPWM); 							//Y_MCPWM start
+	if(ret != ESP_OK) {if(ret == ESP_ERR_INVALID_ARG) { ESP_LOGE(MCPWM_TAG, "Fail START Y_MCPWM. Error invalid argument"); return -9; }}
+	xEventGroupSetBits(mcpwm_event_group, MCPWM_START_BIT);				//set flag START
+	ESP_LOGI(MCPWM_TAG, "START mcpwm");
+	return 1;
+}
+int resume_rotate_mcpwm(char *sel_str) {
+	struct_mcpwm counting; static arg_task_rotate val_task; val_task.dir = 0; val_task.answer = 0;
+	shift_string(sel_str, 6);		//string left shift by 5 symbol
+	EventBits_t uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0);
+	portBASE_TYPE xStatus_Read_X = 0, xStatus_Read_Y = 0, xStatus_Read_Z = 0; char two_str[9] = "";
+	if(!strncmp(sel_str,":z",2))	{
+		if(( uxBits & MCPWM_Z_ALLOW_BIT ) != 0) {
+			xStatus_Read_Z = xQueuePeek(Z_step_queue, &counting, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read_Z == pdPASS) { strcpy(sel_str, "Z_MCPWM");
+				xTaskCreatePinnedToCore(task_rotate_X_MCPWM, "task_rotate_Z_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_Z, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "No data in Z_step_queue. No pausing rotating!"); return -10; }
+		} else { ESP_LOGE(MCPWM_TAG, "mcpwm Z busy!"); return -6; }		//if no set flag ALLOW
+	} else if(!strncmp(sel_str,":x",2))	{
+		if(( uxBits & MCPWM_X_ALLOW_BIT ) != 0) {
+			xStatus_Read_X = xQueuePeek(X_step_queue, &counting, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read_X == pdPASS) { strcpy(sel_str, "X_MCPWM");
+				xTaskCreatePinnedToCore(task_rotate_X_MCPWM, "task_rotate_X_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_X, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "No data in X_step_queue. No pausing rotating!"); return -10; }
+		} else { ESP_LOGE(MCPWM_TAG, "mcpwm X busy!"); return -6; }		//if no set flag ALLOW
+	} else if(!strncmp(sel_str,":y",2))	{
+		if(( uxBits & MCPWM_Y_ALLOW_BIT ) != 0) {
+			xStatus_Read_Y = xQueuePeek(Y_step_queue, &counting, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read_Y == pdPASS) { strcpy(sel_str, "Y_MCPWM");
+				xTaskCreatePinnedToCore(task_rotate_Y_MCPWM, "task_rotate_Y_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_Y, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "No data in Y_step_queue. No pausing rotating!"); return -10; }
+		} else { ESP_LOGE(MCPWM_TAG, "mcpwm Y busy!"); return -6; }		//if no set flag ALLOW
+	} else {
+		if(( uxBits & MCPWM_Z_ALLOW_BIT ) != 0) {
+			xStatus_Read_Z = xQueuePeek(Z_step_queue, &counting, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read_Z == pdPASS) { strcpy(sel_str, "Z_MCPWM");
+				xTaskCreatePinnedToCore(task_rotate_Z_MCPWM, "task_rotate_Z_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_Z, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "No data in Z_step_queue. No pausing rotating!"); strcpy(sel_str, ""); }
+		} else { ESP_LOGE(MCPWM_TAG, "mcpwm Z busy!"); }		//if no set flag ALLOW
+		if(( uxBits & MCPWM_X_ALLOW_BIT ) != 0) {
+			xStatus_Read_X = xQueuePeek(X_step_queue, &counting, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read_X == pdPASS) { strcpy(sel_str, "X_MCPWM");
+				xTaskCreatePinnedToCore(task_rotate_X_MCPWM, "task_rotate_X_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_X, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "No data in X_step_queue. No pausing rotating!"); strcpy(sel_str, ""); }
+		} else { ESP_LOGE(MCPWM_TAG, "mcpwm X busy!"); }		//if no set flag ALLOW
+		if(( uxBits & MCPWM_Y_ALLOW_BIT ) != 0) {
+			xStatus_Read_Y = xQueuePeek(Y_step_queue, &counting, 10 / portTICK_PERIOD_MS);
+			if(xStatus_Read_Y == pdPASS) { strcpy(two_str, "Y_MCPWM");
+				xTaskCreatePinnedToCore(task_rotate_Y_MCPWM, "task_rotate_Y_MCPWM", 4096, &val_task, 5, (TaskHandle_t *const)&pxCreatedTask_Y, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "No data in Y_step_queue. No pausing rotating!"); }
+		} else { ESP_LOGE(MCPWM_TAG, "mcpwm Y busy!"); }		//if no set flag ALLOW
+	}
+	if(((uxBits & (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT)) == (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT))
+			|| (( uxBits & MCPWM_X_ALLOW_BIT ) != 0) || (( uxBits & MCPWM_Y_ALLOW_BIT ) != 0) || (( uxBits & MCPWM_Z_ALLOW_BIT ) != 0)) {
+		if((xStatus_Read_X != pdPASS) && (xStatus_Read_Y != pdPASS) && (xStatus_Read_Z != pdPASS)) { ESP_LOGE(MCPWM_TAG, "No data in queue. No pausing rotating!"); return -10; }
+		ESP_LOGI(MCPWM_TAG, "RESUME rotate %s %s", sel_str, two_str);
+	} else { ESP_LOGE(MCPWM_TAG, "Fail RESUME. mcpwm X,Y,Z busy!"); return -6; }		//if no set flag ALLOW
+	return 1;
+}
+
+static void task_joystick_rotation(void *arg) {
+	char str[15] = "";
+	ESP_LOGI(MCPWM_TAG, "start task_joystick_rotation...");
+	int vrx, vry; esp_err_t ret; static arg_task_rotate val_right, val_left, val_down, val_up;
+	val_right.answer = 0; val_left.answer = 0; val_down.answer = 0; val_up.answer = 0;
+	val_right.dir = RIGHT_X; val_left.dir = LEFT_X; val_down.dir = DOWN_Y; val_up.dir = UP_Y;
+	while(1){
+		if (0 == gpio_get_level(JOYSTICK_OFF)) break;
+		ret = adc2_get_raw((adc1_channel_t)ch2, ADC_WIDTH_BIT_10, &vrx);	//Reading X (left - right)
+		if (ret != ESP_OK) { ESP_LOGE(MCPWM_TAG,"Failed read ch2 ADC2. Ret: %d", ret); break; }
+		if ((vrx >= 450)&&(vrx <= 550)) {									//Middle position X
+			if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, (TickType_t) 0)) == 0) {
+				sprintf(str,"pause:x"); pause_rotate(str); mcpwm_set_frequency(MCPWM_UNIT_0, X_MCPWM, FREQ_X_MCPWM);//if MCPWM - X is rotating - stop
+			}
+		}
+		else if ((vrx >= 0)&&(vrx < 450)) {
+			mcpwm_set_frequency(MCPWM_UNIT_0, X_MCPWM, (uint32_t)((FREQ_X_MCPWM-200)-((FREQ_X_MCPWM-390)/450)*vrx));
+			rotate_one_mcpwm(&val_right, 100000);
+		} else if ((vrx > 550)&&(vrx <= 1023)) {
+			uint32_t freq = (uint32_t)(((FREQ_X_MCPWM-390)/450)*vrx-(FREQ_X_MCPWM+100));
+			mcpwm_set_frequency(MCPWM_UNIT_0, X_MCPWM, abs(freq));
+			rotate_one_mcpwm(&val_left, 100000);
+		}
+		ret = adc2_get_raw((adc1_channel_t)ch3, ADC_WIDTH_BIT_10, &vry);	//Reading Y (up - down)
+		if (ret != ESP_OK) { ESP_LOGE(MCPWM_TAG,"Failed read ch3 ADC2. Ret: %d", ret); break; }
+		if ((vry >= 450)&&(vry <= 550)) {									//Middle position Y
+			if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0)) == 0) {
+				sprintf(str,"pause:y"); pause_rotate(str); mcpwm_set_frequency(MCPWM_UNIT_0, Y_MCPWM, FREQ_Y_MCPWM);//if MCPWM - Y is rotating - stop
+			}
+		}
+		else if ((vry >= 0)&&(vry < 450)) {
+			mcpwm_set_frequency(MCPWM_UNIT_0, Y_MCPWM, (uint32_t)(FREQ_Y_MCPWM-((FREQ_Y_MCPWM-70)/450)*vry));
+			rotate_one_mcpwm(&val_down, 20000);
+		} else if ((vry > 550)&&(vry <= 1023)) {
+			uint32_t freq = (uint32_t)(((FREQ_Y_MCPWM-70)/450)*vry-(FREQ_Y_MCPWM+200));
+			mcpwm_set_frequency(MCPWM_UNIT_0, Y_MCPWM, abs(freq));
+			rotate_one_mcpwm(&val_up, 20000);
+		}
+
+		vTaskDelay(100 / portTICK_PERIOD_MS);
+	}
+	sprintf(str,"pause"); pause_rotate(str);
+	ESP_LOGI(MCPWM_TAG, "task_joystick_rotation - STOP");
+	xQueueReset(X_step_queue); xQueueReset(Y_step_queue);	//Clear buffer for step data
+	mcpwm_set_frequency(MCPWM_UNIT_0, X_MCPWM, FREQ_X_MCPWM);
+	mcpwm_set_frequency(MCPWM_UNIT_0, Y_MCPWM, FREQ_Y_MCPWM);
+	pxCreatedTask_joystick = NULL;
+	vTaskDelete(NULL);
+}
+int joystick_rotation_control(char *str) {
+	shift_string(str, 9);		//string left shift by 9 symbol
+	if(!strncmp(str,"start",5)) {//start joystick control mcpwm?
+		if(pxCreatedTask_joystick == NULL) {
+			EventBits_t uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT, false, false, (TickType_t) 0);
+			if((uxBits & (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT)) == (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT)) {
+				xTaskCreatePinnedToCore(task_joystick_rotation, "task_joystick_rotation", 4096, NULL, 7, (TaskHandle_t *const)&pxCreatedTask_joystick, 1);
+			} else { ESP_LOGE(MCPWM_TAG, "mcpwm X or Y busy!"); return -6; }		//if no set flag ALLOW
+		} else { ESP_LOGE(MCPWM_TAG, "Fail start Joystick. It is already running!"); return -8; }
+	} else if(!strncmp(str,"stop",4)) {
+		if(pxCreatedTask_joystick != NULL) {
+			sprintf(str,"pause"); int ret = pause_rotate(str); if(ret == -5) return -16;
+			vTaskDelete(pxCreatedTask_joystick);
+			ESP_LOGI(MCPWM_TAG, "task_joystick_rotation - STOP");
+			pxCreatedTask_joystick = NULL;
+			mcpwm_set_frequency(MCPWM_UNIT_0, X_MCPWM, FREQ_X_MCPWM);
+			mcpwm_set_frequency(MCPWM_UNIT_0, Y_MCPWM, FREQ_Y_MCPWM);
+			xQueueReset(X_step_queue); xQueueReset(Y_step_queue);	//Clear buffer for step data
+		} else { ESP_LOGE(MCPWM_TAG, "Fail stop Joystick. No start!"); return -8; }
+	} else { ESP_LOGE(MCPWM_TAG, "no such command Joystick control: %s", str); return -3; } 	//error= -3
+	return 1;
+}
+
+int set_zero_z(void) {
+	char string[30] = "";									//If running joystick then stop
+	static arg_task_rotate val_task; val_task.answer = 0; val_task.dir = RIGHT_Z;
+	if((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) != 0) {
+		if(!gpio_get_level(ZERO_Z_R)) return 1;
+		int ret = rotate_one_mcpwm(&val_task, MAX_Z+1000);							//Start rotate
+		if(ret == 1) {
+			while(gpio_get_level(ZERO_Z_R) || (ret == 1)) {
+				if(!gpio_get_level(ZERO_Z_R) && !gpio_get_level(ZERO_Z_R)) {		//Completed rotate to zero area of the Z-axis
+					ESP_LOGI(MCPWM_TAG, "ZERO - Z");
+					if(xSemaphoreGive(Z_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+					position_mirror = 0;
+					taskYIELD(); vTaskDelay(1); ret = 2;
+				}
+				if (0 == gpio_get_level(JOYSTICK_OFF)) { position_mirror = -1; sprintf(string,"pause"); pause_rotate(string); break; }	//Off set_zero
+				vTaskDelay(1);
+			}
+		} else { ESP_LOGE(MCPWM_TAG, "fail set zero point MCPWM! Error: %d", ret); return -15; }
+	} else { ESP_LOGE(MCPWM_TAG, "mcpwm Z busy!"); return -6; }		//if no set flag ALLOW
+	return 1;
+}
+int set_zero_xy(void) {
+	char string[30] = ""; int ret;								//If running joystick then stop
+	static arg_task_rotate val_x, val_y; val_x.answer = 0; val_y.answer = 0; val_x.dir = LEFT_X; val_y.dir = UP_Y;
+	EventBits_t uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT, false, true, (TickType_t) 0);
+	if((uxBits & (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT)) == (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT)) {}
+	else { ESP_LOGE(MCPWM_TAG, "mcpwm X or Y busy!"); return -6; }		//if no set flag ALLOW
+	if(pxCreatedTask_joystick != NULL) { sprintf(string,"joystick/stop"); if(1 != joystick_rotation_control(string)) return -15; }
+	xQueueReset(X_step_queue); xQueueReset(Y_step_queue);	//Clear buffer for step data
+	if(gpio_get_level(ZERO_X) && !gpio_get_level(ZERO_Y)) return 1;		//If end zero XY
+	if(gpio_get_level(ZERO_Y)) {
+		ret = rotate_one_mcpwm(&val_y, MAX_Y*1030);
+		if(ret == 1) {
+			while(! (pdTRUE == xSemaphoreTake(Y_step_ok_Semaphore,0))) {
+				if(!gpio_get_level(ZERO_Y)) {		//Completed rotate to zero area of the Y-axis
+					ESP_LOGI(MCPWM_TAG, "ZERO - Y");
+					if(xSemaphoreGive(Y_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+					taskYIELD(); vTaskDelay(1);
+				}
+				if (0 == gpio_get_level(JOYSTICK_OFF)) { sprintf(string,"pause"); pause_rotate(string); break; }	//Off set_zero
+				vTaskDelay(1);
+			}
+		} else { ESP_LOGE(MCPWM_TAG, "fail set zero point MCPWM! Error: %d", ret); return -15; }
+	}
+	if(!gpio_get_level(ZERO_X)) {
+		ret = rotate_one_mcpwm(&val_x, MAX_X*1030);
+		if(ret == 1) {
+			while(! (pdTRUE == xSemaphoreTake(X_step_ok_Semaphore,0))) {
+				if(gpio_get_level(ZERO_X)) {		//Completed rotate to zero area of the X-axis
+					ESP_LOGI(MCPWM_TAG, "ZERO - X");
+					if(xSemaphoreGive(X_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+					taskYIELD(); vTaskDelay(1);
+				}
+				if (0 == gpio_get_level(JOYSTICK_OFF)) { sprintf(string,"pause"); pause_rotate(string); break; }	//Off set_zero
+				vTaskDelay(1);
+			}
+		} else { ESP_LOGE(MCPWM_TAG, "fail set zero point MCPWM! Error: %d", ret); return -15; }
+	}
+	return 1;
+}
+
+int command_mcpwm(char *str) {
+	shift_string(str, 6);		//string left shift by 6 symbol
+	if(!strncmp(str,"_",1))	{	//which command mcpwm?
+		shift_string(str, 1);		//string left shift by 1 symbol
+		if(!strncmp(str,"pause",5))	{			//pause?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+				return pause_rotate(str);
+			} else { ESP_LOGE(MCPWM_TAG, "Fail PAUSE. mcpwm stop!"); return -7; }	//if no clear flag ALLOW
+		} else if(!strncmp(str,"stop",4))	{	//stop?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+				return stop_rotate();
+			} else { ESP_LOGE(MCPWM_TAG, "Fail STOP. mcpwm stop!"); return -7; }	//if no set flag START
+		} else if(!strncmp(str,"start",5))	{	//start?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) == 0) {
+				return start_rotate();
+			} else { ESP_LOGE(MCPWM_TAG, "Fail START. mcpwm no stop!"); return -7; }	//if no clear flag START
+		} else if(!strncmp(str,"resume",6)) {	//resume?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+				return resume_rotate_mcpwm(str);
+			} else { ESP_LOGE(MCPWM_TAG, "Fail RESUME. mcpwm stop!"); return -7; }	//if no set flag START
+		} else if(!strncmp(str,"zero:xy",7)) {		//set position zero XY axis?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+				return set_zero_xy();
+			} else { ESP_LOGE(MCPWM_TAG, "Fail ZERO XY. mcpwm stop!"); return -7; }	//if no set flag START
+		} else if(!strncmp(str,"zero:z",6)) {		//set position zero Z axis?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+				return set_zero_z();
+			} else { ESP_LOGE(MCPWM_TAG, "Fail ZERO Z. mcpwm stop!"); return -7; }	//if no set flag START
+		} else if(!strncmp(str,"joystick",8)) {//manual (joystick) control mcpwm?
+			if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+				return joystick_rotation_control(str);
+			} else { ESP_LOGE(MCPWM_TAG, "Fail ZERO. mcpwm stop!"); return -7; }	//if no set flag START
+		} else { ESP_LOGE(MCPWM_TAG, "no such command mcpwm: %s", str); return -3; } 	//error= -3
+	} else {
+		if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, (TickType_t) 0)) != 0) {
+			return rotate_mcpwm(str);
+		} else { ESP_LOGE(MCPWM_TAG, "Fail rotate. mcpwm stop!"); return -7; }	//if no set flag START
+	}
+	return 1;				//Command completed
+}
+
+int safe_go_mirror(int dir) {
+	struct_mcpwm count; portBASE_TYPE xStatus_Read = (int)NULL;
+	vTaskDelay(10 / portTICK_PERIOD_MS);
+	while((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) == 0) {
+		if(((!gpio_get_level(ZERO_Z_L)) && (!gpio_get_level(ZERO_Z_L)) && (dir == LEFT_Z)) || ((!gpio_get_level(ZERO_Z_R)) && (!gpio_get_level(ZERO_Z_R)) && (dir == RIGHT_Z))) {		//Completed rotate to left and right end area of the Z-axis
+			vTaskDelay(1 / portTICK_PERIOD_MS);
+			if(((!gpio_get_level(ZERO_Z_L)) && (!gpio_get_level(ZERO_Z_L)) && (dir == LEFT_Z)) || ((!gpio_get_level(ZERO_Z_R)) && (!gpio_get_level(ZERO_Z_R)) && (dir == RIGHT_Z))) {
+				xStatus_Read = xQueueReceive(Z_step_queue, &count, (TickType_t) 10);
+				if(xStatus_Read != pdPASS) { ESP_LOGE("scan", "Error reading Z_step_queue!. Ret = %d", xStatus_Read); }
+				if(xSemaphoreGive(Z_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+				vTaskDelay(1);
+				ESP_LOGE("scan", "End pos!");
+				if(dir == RIGHT_Z) position_mirror = 0; else position_mirror = 10160;
+			}
+		}
+		vTaskDelay(10 / portTICK_PERIOD_MS);
+		if (0 == gpio_get_level(JOYSTICK_OFF)) { 	//Off set_zero
+			if(xSemaphoreGive(Z_step_ok_Semaphore) != pdTRUE) { ESP_LOGE(MCPWM_TAG, "Error give semaphore!"); }
+			ESP_LOGI("scan", "Rotating Z - stopped!");
+			position_mirror = -1; return -13;
+		}
+	}
+	if(xStatus_Read == (int)NULL) {
+		xStatus_Read = xQueueReceive(Z_step_queue, &count, (TickType_t) 10);
+		if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { count.step_value = 0; /*ESP_LOGI(MCPWM_TAG, "No step Z_queue!");*/ } }
+	}
+//	ESP_LOGI("scan", "count.step_value = %d", count.step_value);
+	return (int)roundf(count.step_value * STEP_Z_UM);
+}
+int check_pos_mirror(void) {
+	if(position_mirror == -1) {
+		static arg_task_rotate val_task;
+		val_task.dir = RIGHT_Z; val_task.answer = 0;
+		int ret = rotate_one_mcpwm(&val_task, MAX_Z+1000);
+		if(ret != 1) { ESP_LOGE("scan", "fail set right next position Z. Error: %d", ret); return ret; }
+		int set_dist = (MAX_Z+1000) - safe_go_mirror(RIGHT_Z);
+		if(set_dist > (MAX_Z+1000)) return -21;
+		vTaskDelay(200 / portTICK_PERIOD_MS);
+		val_task.dir = LEFT_Z;
+		ret = rotate_one_mcpwm(&val_task, set_dist);
+		if(ret != 1) { ESP_LOGE("scan", "fail set left next position Z. Error: %d", ret); return ret; }
+		if(0 != safe_go_mirror(LEFT_Z)) return -19;
+		position_mirror = set_dist;
+	}
+	return position_mirror;
+}
+int set_pos_mirror(int set_position) {
+	int ret = 0; static arg_task_rotate val_task; val_task.answer = 0;
+	if(set_position > check_pos_mirror()) {
+		if(position_mirror < 0) return -21;
+		val_task.dir = LEFT_Z;
+		ret = rotate_one_mcpwm(&val_task, set_position-position_mirror);
+	} else {
+		val_task.dir = RIGHT_Z;
+		if(set_position != check_pos_mirror()) ret = rotate_one_mcpwm(&val_task, position_mirror-set_position); else return 1;
+	}
+	if(ret != 1) { ESP_LOGE("scan", "fail set next position Z. Error: %d", ret); return ret; }
+	if(0 != safe_go_mirror(val_task.dir)) return -19;
+	position_mirror = set_position;
+	return 1;
+}
+static void task_scan_phase_profile(void *arg) {	//st_pos: 0-set_zero_z, <0-no rotate Z, >0-set_pos_mirror/window: 0-to end position, >0-window
+	ESP_LOGI("scan", "start scan_phase_profile...");
+	volatile arg_task_scan *px_arg;	px_arg = (arg_task_scan *) arg;
+	if(px_arg->st_pos_z == 0) { if(1 != set_zero_z()) { pxCreatedTask_scan_pp = NULL; vTaskDelete(NULL); } }
+	else {
+		if(px_arg->st_pos_z > 0) { if(1 != set_pos_mirror(px_arg->st_pos_z)) { pxCreatedTask_scan_pp = NULL; vTaskDelete(NULL); } }
+		else px_arg->st_pos_z = check_pos_mirror();
+	}
+	vTaskDelay(200 / portTICK_PERIOD_MS);
+	if(px_arg->axis_z == 0) { px_arg->axis_z = MAX_Z+1000; }
+	else { if(px_arg->axis_z > 0) px_arg->axis_z += check_pos_mirror(); else { pxCreatedTask_scan_pp = NULL; vTaskDelete(NULL); } }
+	ESP_LOGI("	scan", "	pos = 	%d	ADC = 	%d	progress: 	0	%%	remaining time: 	-	 sec =.", position_mirror, reading_adc1_smooth_max_period());
+	TickType_t start_time = 0; int ret = 0;
+	for(int set_pos = position_mirror + px_arg->step_z; set_pos <= px_arg->axis_z; set_pos += px_arg->step_z) {
+		start_time = portTICK_PERIOD_MS*xTaskGetTickCount();
+		ret = set_pos_mirror(set_pos);	if(ret != 1) break;				//Next step Z
+		vTaskDelay(5 / portTICK_PERIOD_MS);
+		ESP_LOGI("	scan", "	pos = 	%d	ADC =	%d	progress: 	%d	%%	remaining time: 	%d	 sec =.", position_mirror, reading_adc1_smooth_max_period(),
+		(position_mirror-px_arg->st_pos_z)*100/((px_arg->axis_z-px_arg->st_pos_z)), (((portTICK_PERIOD_MS*xTaskGetTickCount()) - start_time)*((px_arg->axis_z-position_mirror)/px_arg->step_z))/1000);
+	}
+	if(ret == 1) ESP_LOGI("	scan", "	scan_pp - 	DONE 100%%!	=.");
+	else if(ret == -19) ESP_LOGI("	scan", "	scan_pp - 	ABORTED (end Z-axis)! =."); else ESP_LOGE("	scan", "	scan_pp - 	ERROR! Ret: %d =.", ret);
+	succes_process(BUZZ_PIN);
+	pxCreatedTask_scan_pp = NULL;
+	vTaskDelete(NULL);
+}
+int set_min_phase(int start_step) {
+	int ret, index_end=0; int answer = 0;
+	int *ampl; ampl = (int*)malloc(500 * sizeof(int));					//Memory allocation ADC data
+	int *position; position = (int*)malloc(500 * sizeof(int));				//Memory allocation position mirror data
+	if (ampl == NULL) { ESP_LOGE(ADC, "failed create dynamic massive amplitude"); return -11; }
+	if (position == NULL) { ESP_LOGE(ADC, "failed create dynamic massive position"); return -11; }
+	if(start_step < 0) {
+		ESP_LOGI("scan", "start set minimum phase signal...");
+		start_step = abs(start_step); answer = 1;
+	}
+	//1th search minimum for start step
+	for(int i=0, n=0, up=0, down=0, find=0, dir=1, set_pos=check_pos_mirror()+start_step; find != 1; i++, n++, set_pos+=(dir*start_step)) { //rep=0
+		ampl[i] = reading_adc1_smooth_max_period();
+//		ESP_LOGI("scan", "ADC[%d] = %d", i, ampl[i]);
+		position[i] = check_pos_mirror();
+		if(n >= 4) {
+			for(int s=0, up_1=0, down_1=0; s < 4; s++) {
+				if(ampl[i-4+s] > ampl[i-3+s]) {  down_1++; up_1=0; }
+				else if(ampl[i-4+s] < ampl[i-3+s]) { up_1++; down_1=0; } else { down_1=0; up_1=0; }
+				if(up_1 > 2) { up++; down=0; }
+				if(down_1 > 2) { down++; up=0; }
+			}
+//			ESP_LOGI("scan", "up = %d, down = %d", up, down);
+			if(up > 2) {
+				if(find == 2) { find = 1; ret = 1; index_end = i; }  	//find=2 if 2 signal increases were found
+				else { dir *= -1; find = 2; n = 0; } 					//If an increase in the signal was detected 1 time
+				up = 0;													//Clear up variable
+//				ESP_LOGI("scan", "find = %d, dir = %d", find, dir);
+			} else if(down > 2) {
+				if(find == 2) {  }
+				else { find = 2; }
+//				ESP_LOGI("scan", "find = %d, dir = %d", find, dir);
+			}
+		}
+		ret = set_pos_mirror(set_pos);								//Set next position
+		if(ret != 1) { ESP_LOGE("scan", "fail 1th set next position phase. Error: %d", ret); break; }
+		if(i >= 499) { ret = -20; ESP_LOGE("scan", "Not found 1th minimum phase signal!"); break; }
+	}
+	if(ret != 1) { ESP_LOGE("scan", "fail 1th search minimum phase. Error: %d", ret); return ret; }
+	for(int n = 0, min_sig = 10000; n < index_end; n++) { if(ampl[n] < min_sig) { min_sig = ampl[n]; ret = n; } }	//Search minimum
+//	ESP_LOGI("scan", "1th min_signal = %d, position = %d, i = %d", ampl[ret], position[ret], ret); index_end = ret;
+	ret = set_pos_mirror(position[ret]);							//Set minimum phase position
+	if(ret != 1) { ESP_LOGE("scan", "fail 1th set min position phase. Error: %d", ret); return ret; }
+	//2th search minimum for precise step = 5 um
+	for(int i=0, up=0, down=0, n=0, find=0, dir=1, set_pos=check_pos_mirror()+2; find != 1; i++, n++, set_pos+=(dir*2)) {	//rep=0;;
+		ampl[i] = reading_adc1_smooth_max_period();
+//		ESP_LOGI("scan", "ADC[%d] = %d", i, ampl[i]);
+		position[i] = check_pos_mirror();
+		if(n >= 4) {
+			for(int s=0, up_1=0, down_1=0; s < 4; s++) {
+				if(ampl[i-4+s] > ampl[i-3+s]) {  down_1++; up_1=0; }
+				else if(ampl[i-4+s] < ampl[i-3+s]) { up_1++; down_1=0; } else { down_1=0; up_1=0; }
+				if(up_1 > 2) { up++; down=0; }
+				if(down_1 > 2) { down++; up=0; }
+			}
+//			ESP_LOGI("scan", "up = %d, down = %d", up, down);
+			if(up > 2) {
+				if(find == 2) { find = 1; ret = 1; index_end = i; }  	//find=2 if 2 signal increases were found
+				else { dir *= -1; find = 2; n = 0; } 					//If an increase in the signal was detected 1 time
+				up = 0;													//Clear up variable
+//				ESP_LOGI("scan", "find = %d, dir = %d", find, dir);
+			} else if(down > 2) {
+				if(find == 2) {  }
+				else { find = 2; }
+//				ESP_LOGI("scan", "find = %d, dir = %d", find, dir);
+			}
+		}
+		ret = set_pos_mirror(set_pos);								//Set next position
+		if(ret != 1) { ESP_LOGE("scan", "fail 2th set next position phase. Error: %d", ret); break; }
+		if(i >= 499) { ret = -20; ESP_LOGE("scan", "Not found 2th minimum phase signal!"); break; }
+	}
+	if(ret != 1) { ESP_LOGE("scan", "fail 2th search minimum phase. Error: %d", ret); return ret; }
+	for(int n = 0, min_sig = 10000; n < index_end; n++) { if(ampl[n] < min_sig) { min_sig = ampl[n]; ret = n; } }	//Search minimum
+	if(answer == 1) { ESP_LOGI("scan", "set min_sig - DONE. %d, POS = %d, i = %d =.", ampl[ret], position[ret], ret); }
+	ret = set_pos_mirror(position[ret]);							//Set minimum phase position
+	if(ret != 1) { ESP_LOGE("scan", "fail 2th set min position phase. Error: %d", ret); return ret; }
+	ret  = position[ret];
+	free(ampl); free(position);
+	return ret;
+}
+static void task_scanning(void *arg) {
+	ESP_LOGI("scan", "start task_scanning...");
+	volatile arg_task_scan *px_arg;	px_arg = (arg_task_scan *) arg; int ret;
+	static arg_task_rotate val_task_x, val_task_y; val_task_x.answer = 0; val_task_y.answer = 0; val_task_x.dir = RIGHT_X; val_task_y.dir = DOWN_Y;
+	const TickType_t xTicksToWait = 100000 / portTICK_PERIOD_MS;
+	ESP_LOGI("scan", "sp:x=%d,y=%d x:%d/%d y:%d/%d mode=%d",px_arg->st_pos_x, px_arg->st_pos_y, px_arg->axis_x, px_arg->step_x, px_arg->axis_y, px_arg->step_y, px_arg->mode);
+	//Set start position
+	if (px_arg->st_pos_x > 0) {
+		ret = rotate_one_mcpwm(&val_task_x, px_arg->st_pos_x); 	//set start position X - RIGHT
+		vTaskDelay(40 / portTICK_PERIOD_MS);
+		if(ret != 1) { ESP_LOGE("scan", "fail set start position X. Error: %d", ret); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next X!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		ESP_LOGI("scan", "set start position (x) - %d", px_arg->st_pos_x);
+	}
+	if (px_arg->st_pos_y > 0) {
+		ret = rotate_one_mcpwm(&val_task_y, px_arg->st_pos_x); 	//set start position Y - LEFT
+		vTaskDelay(40 / portTICK_PERIOD_MS);
+		if(ret != 1) { ESP_LOGE("scan", "fail set start position Y. Error: %d", ret); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next Y!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		ESP_LOGI("scan", "set start position (y) - %d", px_arg->st_pos_y);
+	}
+	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	//Scanning
+	TickType_t start_time = 0; val_task_x.dir = LEFT_X;
+	for (int y = px_arg->st_pos_y; y <= px_arg->axis_y; y = y + px_arg->step_y) {
+		start_time = portTICK_PERIOD_MS*xTaskGetTickCount();
+		if (val_task_x.dir == LEFT_X) val_task_x.dir = RIGHT_X; else val_task_x.dir = LEFT_X;
+		vTaskDelay(200 / portTICK_PERIOD_MS);
+		if(px_arg->mode == AMP_MODE) { ESP_LOGI("	scan", "	ADC = 	%d	=.", reading_adc1_smooth_max_period()); }
+		else if(px_arg->mode == PHASE_MODE) { ESP_LOGI("	scan", "	POS = 	%d	=.", set_min_phase(px_arg->step_z)); } else { ESP_LOGE(MCPWM_TAG, "unknown mode scanning"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		for (int x = px_arg->st_pos_x; x < px_arg->axis_x; x = x + px_arg->step_x) {
+			if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next Y!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+			if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next X!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+			ret = rotate_one_mcpwm(&val_task_x, px_arg->step_x);	//Next position X
+			if(ret != 1) { ESP_LOGE("scan", "fail set next position X. Error: %d", ret); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+			vTaskDelay(20 / portTICK_PERIOD_MS);
+			if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next X!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+			vTaskDelay(50 / portTICK_PERIOD_MS);
+			if(px_arg->mode == AMP_MODE) { ESP_LOGI("	scan", "	ADC = 	%d	=.", reading_adc1_smooth_max_period()); }
+			else if(px_arg->mode == PHASE_MODE) { ESP_LOGI("	scan", "	POS = 	%d	=.", set_min_phase(px_arg->step_z)); } else { ESP_LOGE(MCPWM_TAG, "unknown mode scanning"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		}
+		if (y >= px_arg->axis_y) break;
+		vTaskDelay(100 / portTICK_PERIOD_MS);
+		if((MCPWM_X_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next X!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		ret = rotate_one_mcpwm(&val_task_y, px_arg->step_y);		//Next position Y
+		if(ret != 1) { ESP_LOGE("scan", "fail set next position Y. Error: %d", ret); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+		vTaskDelay(300 / portTICK_PERIOD_MS);
+		if((MCPWM_Y_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Y_ALLOW_BIT, false, false, xTicksToWait)) == 0) { ESP_LOGE(MCPWM_TAG, "timeout set next Y!"); pxCreatedTask_scanning = NULL; vTaskDelete(NULL); }
+//		ESP_LOGI("scan", "iteration time: %d ms", iter_time - start_time);
+		ESP_LOGI("	scan", "	%d %%	 time: 	%d	=.",(y-px_arg->st_pos_y)*100/((px_arg->axis_y-px_arg->st_pos_y)), ((portTICK_PERIOD_MS*xTaskGetTickCount() - start_time)*((px_arg->axis_y-y)/px_arg->step_y))/1000);
+	}
+	ESP_LOGI("	scan", "	scanning - 	DONE 	100%%!	=.");
+	succes_process(BUZZ_PIN);
+	pxCreatedTask_scanning = NULL;
+	vTaskDelete(NULL);
+}
+int start_scanning(char *str) {
+	shift_string(str, 6);
+	static arg_task_scan val_arg;
+	if(!strncmp(str,"profile/",8)) {				//Start process phase profile scanning
+		shift_string(str, 8);
+		if(pxCreatedTask_scan_pp == NULL && pxCreatedTask_scanning == NULL) {
+			if((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) == 0) { ESP_LOGE("scan", "mcpwm Z busy!"); return -6; }		//if no set flag ALLOW
+			static arg_task_scan val_arg;
+			if(!strncmp(str,"sp:",3)) {			//Parsing data for start position
+				shift_string(str, 3);
+				val_arg.st_pos_z = search_slash_convert_num(str);	//Start position
+			} else { val_arg.st_pos_z = -1; }
+			if(!strncmp(str,"z:",2)) {			//Parsing data for Z-axis
+				shift_string(str, 2);
+				val_arg.axis_z = search_slash_convert_num(str); if(val_arg.axis_z < 0) return val_arg.axis_z;	//Dimension Z-axis
+				val_arg.step_z = search_slash_convert_num(str); if(val_arg.step_z < 0) return val_arg.step_z;			//Step
+				if(val_arg.axis_z > MAX_Z) { ESP_LOGE("scan", "invalid dimension Z: %d um > %d um(MAX_Z)", val_arg.axis_z, MAX_Z); return -17; }
+				if((val_arg.st_pos_z > val_arg.axis_z) && (val_arg.axis_z != 0)) { ESP_LOGE("scan", "invalid start position Z: %d um > %d um(axis_z)", val_arg.st_pos_z, val_arg.axis_z); return -17; }
+				if((val_arg.step_z > val_arg.axis_z) && (val_arg.axis_z != 0)) { ESP_LOGE("scan", "invalid step Z: %d um > %d um(axis_z)", val_arg.step_z, val_arg.axis_z); return -17; }
+				xTaskCreatePinnedToCore(task_scan_phase_profile, "task_scan_phase_profile", 4096, &val_arg, 7, (TaskHandle_t *const)&pxCreatedTask_scan_pp, 1);
+				return 1;
+			} else { ESP_LOGE("scan", "unknown axes: %s", str); return -3; }
+		} else { ESP_LOGE("scan", "Fail start Scanning. It is already running!"); return -8; }
+	} else if(!strncmp(str,"amp/",4)) {				//Amplitude start process scanning
+		shift_string(str, 4);
+		val_arg.mode = AMP_MODE;
+	} else if(!strncmp(str,"phase/",6)) {			//Phase start process scanning
+		shift_string(str, 6);
+		val_arg.mode = PHASE_MODE;
+		if(!strncmp(str,"z:",2)) { val_arg.step_z = search_slash_convert_num(str); if(val_arg.step_z < 0) return val_arg.step_z; }	//Start step Z-axis
+		else { val_arg.step_z = 20; }
+	} else { ESP_LOGE("scan", "no such command start scanning: %s", str); return -3; } //error= -3
+	if (val_arg.mode == AMP_MODE || val_arg.mode == PHASE_MODE) {
+		if(pxCreatedTask_scan_pp == NULL && pxCreatedTask_scanning == NULL) {
+			EventBits_t uxBits = xEventGroupWaitBits(mcpwm_event_group, MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0);
+			if((uxBits & (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT)) == (MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT)) {
+				if(pxCreatedTask_joystick != NULL) { sprintf(str,"joystick/stop"); if(1 != joystick_rotation_control(str)) return -15; }
+				if(!strncmp(str,"sp:",3)) {		//Parsing data for start position
+					shift_string(str, 3);
+					val_arg.st_pos_x = search_slash_convert_num(str); if(val_arg.st_pos_x < 0) return val_arg.st_pos_x;	//Start position X-axis
+					val_arg.st_pos_y = search_slash_convert_num(str); if(val_arg.st_pos_y < 0) return val_arg.st_pos_y;	//Start position Y-axis
+				} else { val_arg.st_pos_x = 0; val_arg.st_pos_y = 0; }
+				if(!strncmp(str,"x:",2)) {		//Parsing data for X-axis
+					shift_string(str, 2);
+					val_arg.axis_x = search_slash_convert_num(str); if(val_arg.axis_x < 0) return val_arg.axis_x;	//Dimension X-axis
+					val_arg.step_x = search_slash_convert_num(str); if(val_arg.step_x < 0) return val_arg.step_x;	//Step
+					if(!strncmp(str,"y:",2)) {	//Parsing data for Y-axis
+						shift_string(str, 2);
+						val_arg.axis_y = search_slash_convert_num(str); if(val_arg.axis_y < 0) return val_arg.axis_y;	//Dimension Y-axis
+						val_arg.step_y = search_slash_convert_num(str); if(val_arg.step_y < 0) return val_arg.step_y;	//Step
+						if(val_arg.axis_x > MAX_X) { ESP_LOGE("scan", "invalid dimension X: %d mm > %d mm(MAX_X)", val_arg.axis_x, MAX_X); return -17; }
+						if(val_arg.axis_y > MAX_Y) { ESP_LOGE("scan", "invalid dimension Y: %d mm > %d mm(MAX_Y)", val_arg.axis_y, MAX_Y); return -17; }
+						if(val_arg.st_pos_x > val_arg.axis_x) { ESP_LOGE("scan", "invalid start position X: %d mm > %d mm(axis_x)", val_arg.st_pos_x, val_arg.axis_x); return -17; }
+						if(val_arg.st_pos_y > val_arg.axis_y) { ESP_LOGE("scan", "invalid start position Y: %d mm > %d mm(axis_y)", val_arg.st_pos_y, val_arg.axis_y); return -17; }
+						if(val_arg.step_x/1000 > val_arg.axis_x) { ESP_LOGE("scan", "invalid step X: %4.2f mm > %d mm(axis_x)", (float)(val_arg.step_x/1000), val_arg.axis_x); return -17; }
+						if(val_arg.step_y/1000 > val_arg.axis_y) { ESP_LOGE("scan", "invalid step Y: %4.2f mm > %d mm(axis_y)", (float)(val_arg.step_y/1000), val_arg.axis_y); return -17; }
+						val_arg.axis_x *= 1000; val_arg.axis_y *= 1000; val_arg.st_pos_x *= 1000; val_arg.st_pos_y *= 1000;
+						xTaskCreatePinnedToCore(task_scanning, "task_scanning", 4096, &val_arg, 7, (TaskHandle_t *const)&pxCreatedTask_scanning, 1);
+						return 1;
+					} else { ESP_LOGE("scan", "unknown axes: %s", str); return -3; }
+				} else { ESP_LOGE("scan", "unknown axes: %s", str); return -3; }
+			} else { ESP_LOGE("scan", "mcpwm X or Y or Z busy! uxBits = %d", uxBits); return -6; }		//if no set flag ALLOW
+		} else { ESP_LOGE("scan", "Fail start Scanning. It is already running!"); return -8; }
+	} else { ESP_LOGE("scan", "unknown mode scan: %s mode = %d", str, val_arg.mode); return -3; } //error= -3
+}
+int scanning_control(char *str) {
+	shift_string(str, 5); int ret;
+	if(!strncmp(str,"phase_min:",10)) {				//Phase control scanning
+		shift_string(str, 10);
+		ret = set_min_phase(-1*search_slash_convert_num(str)); if(ret < 0) return ret;
+	} else if(!strncmp(str,"set_pos_z:",10)) {
+		shift_string(str, 10);
+		if((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) == 0) { ESP_LOGE("scan", "mcpwm Z busy!"); return -6; }		//if no set flag ALLOW
+		ret = set_pos_mirror(search_slash_convert_num(str)); if(ret < 0) return ret;
+	} else if(!strncmp(str,"check_pos_z",11)) {
+		if((MCPWM_Z_ALLOW_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_Z_ALLOW_BIT, false, false, (TickType_t) 0)) == 0) { ESP_LOGE("scan", "mcpwm Z busy!"); return -6; }		//if no set flag ALLOW
+		ret = check_pos_mirror(); if(ret < 0) return ret; else ESP_LOGI("scan", "Mirror position = %d =.", ret);
+	} else if(!strncmp(str,"start/",6)) { //Start process scanning (amplitude, phase, profile)
+		ret = start_scanning(str); if(ret < 0) return ret;
+	} else if(!strncmp(str,"stop",4)) {			//stop process scanning
+		if(pxCreatedTask_scanning != NULL) {
+			sprintf(str,"pause"); ret = pause_rotate(str); if(ret == -5) return -16;
+			vTaskDelete(pxCreatedTask_scanning);
+			ESP_LOGI("scan", "task_scanning - STOP");
+			pxCreatedTask_scanning = NULL;
+		} else {
+			if(pxCreatedTask_scan_pp != NULL) {
+				sprintf(str,"pause"); ret = pause_rotate(str); if(ret == -5) return -16;
+				vTaskDelete(pxCreatedTask_scan_pp);
+				ESP_LOGI("scan", "task_scan_pp - STOP");
+				pxCreatedTask_scan_pp = NULL;
+				struct_mcpwm count;
+				portBASE_TYPE xStatus_Read = xQueueReceive(Z_step_queue, &count, (TickType_t) 10);
+				if(xStatus_Read != pdPASS) { if(xStatus_Read == errQUEUE_EMPTY) { ESP_LOGE(MCPWM_TAG, "No step Z_queue!"); return -19; } }
+				position_mirror = -1;
+			} else { ESP_LOGE("scan", "Fail stop Scanning. No start!"); return -8;  }
+		}
+	} else if(!strncmp(str,"check",5)) {			//check status running task_scan_amp
+		if(pxCreatedTask_scanning != NULL) ESP_LOGI("scan", "task_scan_amplitude - RUN");
+		else ESP_LOGI("scan", "task_scan_amp - NO RUN");
+		if(pxCreatedTask_scan_pp != NULL) ESP_LOGI("scan", "task_scan_phase_profile - RUN");
+		else ESP_LOGI("scan", "task_scan_phase_profile - NO RUN");
+	} else { ESP_LOGE("scan", "no such command scanning_control: %s", str); return -3; } //error= -3
+	return 1;
+}
+
+static int handler_command(char *string) {
+	if(!strncmp(string,"c/",2))	{		//compares the first symbol == 'c' it means a command
+		shift_string(string, 2);		//string left shift by 2 symbol
+		if(!strncmp(string,"status/",7)) {	//reading status bit
+			return reading_status(string);
+		} else if(!strncmp(string,"scan/",5))	{	//which driver? scanning_control?
+			return scanning_control(string);
+		} else if(!strncmp(string,"mcpwm/",6))	{	//which driver? mcpwm?
+			return command_mcpwm(string);
+		} else if(!strncmp(string,"adc/",4)) {		//which driver? adc?
+			return command_adc(string);
+		} else if(!strncmp(string,"gpio/",5)) {		//which driver? gpio?
+			return command_gpio(string);
+		} else if(!strncmp(string,"reboot",6)) {	//rebooting esp32?
+			ESP_LOGI("handler_cmd", "Rebooting ESP32...");
+			esp_restart();
+		} else {
+			ESP_LOGE("handler_cmd", "no such driver: %s", string); return -2;
+		}	//error= -2 (no such driver)
+	}
+	else { return 0; }		//No command
+	return 1;				//Command completed
+}
+
+static void mcpwm_gpio_initialize(void) {
+	ESP_LOGI(MCPWM_TAG, "initializing mcpwm gpio...");
+    mcpwm_pin_config_t pin_config = {
+		.mcpwm0a_out_num = GPIO_PWM0A_OUT,
+		.mcpwm0b_out_num = GPIO_PWM0B_OUT,
+		.mcpwm1a_out_num = GPIO_PWM1A_OUT,
+		.mcpwm1b_out_num = GPIO_PWM1B_OUT,
+		.mcpwm2a_out_num = GPIO_PWM2A_OUT,
+		.mcpwm2b_out_num = GPIO_PWM2B_OUT,
+		.mcpwm_cap0_in_num   = GPIO_CAP0_IN,
+		.mcpwm_cap1_in_num   = GPIO_CAP1_IN,
+		.mcpwm_cap2_in_num   = GPIO_CAP2_IN
+	};
+	mcpwm_set_pin(MCPWM_UNIT_0, &pin_config);
+	gpio_pulldown_en(GPIO_CAP0_IN);    //Enable pull down on CAP0   signal
+	gpio_pulldown_en(GPIO_CAP1_IN);    //Enable pull down on CAP1   signal
+	gpio_pulldown_en(GPIO_CAP2_IN);    //Enable pull down on CAP2   signal
+
+	gpio_set_direction(ZERO_X, GPIO_MODE_INPUT);
+	gpio_set_direction(ZERO_Y, GPIO_MODE_INPUT);
+	gpio_set_direction(ZERO_Z_L, GPIO_MODE_INPUT);
+	gpio_set_direction(ZERO_Z_R, GPIO_MODE_INPUT);
+	gpio_pulldown_en(ZERO_X);		   //Enable pull down on zero area of the X-axis
+	gpio_pulldown_en(ZERO_Y);		   //Enable pull down on zero area of the Y-axis
+	gpio_pulldown_en(ZERO_Z_L);		   //Enable pull down on zero area of the Z-axis left position
+	gpio_pulldown_en(ZERO_Z_R);		   //Enable pull down on zero area of the Z-axis right position
+	gpio_pullup_en(JOYSTICK_OFF);  	   //Enable pull up on Joystick button
+    ESP_LOGI(MCPWM_TAG, "initializing DONE!");
+}
+static void mcpwm_config(void *arg) {
+	//1. mcpwm gpio initialization
+    mcpwm_gpio_initialize();
+    //2. initialize mcpwm configuration
+    ESP_LOGI(MCPWM_TAG, "Configuring Initial Parameters of mcpwm...");
+    mcpwm_config_t pwm_config;
+    pwm_config.frequency = FREQ_X_MCPWM;
+    pwm_config.cmpr_a = 00.0;       //duty cycle of PWM0A = 00.0%
+    pwm_config.cmpr_b = 00.0;       //duty cycle of PWM0b = 00.0%
+    pwm_config.counter_mode = MCPWM_UP_COUNTER;
+    pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+    mcpwm_init(MCPWM_UNIT_0, X_MCPWM, &pwm_config);   //Configure PWM0A & PWM0B with above settings
+    pwm_config.frequency = FREQ_Y_MCPWM;
+    pwm_config.cmpr_a = 00.0;       //duty cycle of PWM1A = 00.0%
+	pwm_config.cmpr_b = 00.0;       //duty cycle of PWM1b = 00.0%
+	pwm_config.counter_mode = MCPWM_UP_COUNTER;
+	pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+	mcpwm_init(MCPWM_UNIT_0, Y_MCPWM, &pwm_config);   //Configure PWM1A & PWM1B with above settings
+	pwm_config.frequency = FREQ_Z_MCPWM;
+	pwm_config.cmpr_a = 00.0;       //duty cycle of PWM2A = 00.0%
+	pwm_config.cmpr_b = 00.0;       //duty cycle of PWM2b = 00.0%
+	pwm_config.counter_mode = MCPWM_UP_COUNTER;
+	pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+	mcpwm_init(MCPWM_UNIT_0, Z_MCPWM, &pwm_config);   //Configure PWM2A & PWM2B with above settings
+    mcpwm_capture_enable(MCPWM_UNIT_0, MCPWM_SELECT_CAP0, MCPWM_POS_EDGE, 0);  //capture signal on rising edge, prescale = 0 i.e. 800,000,000 counts is equal to one second
+    mcpwm_capture_enable(MCPWM_UNIT_0, MCPWM_SELECT_CAP1, MCPWM_POS_EDGE, 0);  //capture signal on rising edge, prescale = 0 i.e. 800,000,000 counts is equal to one second
+    mcpwm_capture_enable(MCPWM_UNIT_0, MCPWM_SELECT_CAP2, MCPWM_POS_EDGE, 0);  //capture signal on rising edge, prescale = 0 i.e. 800,000,000 counts is equal to one second
+    MCPWM[MCPWM_UNIT_0]->int_ena.val =  CAP0_INT_EN | CAP1_INT_EN | CAP2_INT_EN;  //Enable interrupt on CAP0, CAP1 and CAP2  signal
+	mcpwm_isr_register(MCPWM_UNIT_0, isr_handler_cap, NULL, ESP_INTR_FLAG_IRAM, NULL);  //Set ISR Handler
+    ESP_LOGI(MCPWM_TAG, "Configuring DONE!");
+    xEventGroupSetBits(mcpwm_event_group, MCPWM_START_BIT);				//set flag START
+    vTaskDelete(NULL);
+}
+
+static void uart_select_task(void *arg) {
+	if((MCPWM_START_BIT & xEventGroupWaitBits(mcpwm_event_group, MCPWM_START_BIT, false, false, 100 / portTICK_PERIOD_MS)) != 0) {
+		xEventGroupClearBits(mcpwm_event_group, MCPWM_START_BIT);		//clear flag START
+	}
+	ESP_LOGI(UART, "Initialization UART...");
+	vTaskDelay(20 / portTICK_PERIOD_MS);
+    uart_config_t uart_config = {   //Configuring Initial Parameters of UART
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_driver_install(UART_NUM_0, 2*1024, 0, 0, NULL, 0);
+    ESP_LOGI(UART, "Initialization DONE!");
+    while (1) {
+    	ESP_LOGI(UART, "Open UART...");
+        int fd; char buf[BUFFER_SIZE + 1];
+        if ((fd = open("/dev/uart/0", O_RDWR)) == -1) {     //Opening UART
+        	ESP_LOGE(UART, "Cannot open UART");
+            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        esp_vfs_dev_uart_use_driver(0);						//Configuration UART0 driver for read/write data VFS
+        ESP_LOGI(UART, "Open DONE!");
+        xEventGroupSetBits(mcpwm_event_group, MCPWM_START_BIT | MCPWM_X_ALLOW_BIT | MCPWM_Y_ALLOW_BIT | MCPWM_Z_ALLOW_BIT );		//set flag allow action and start mcpqm
+        while (1) {
+            int s; fd_set rfds;
+            struct timeval tv = { .tv_sec = 5, .tv_usec = 0, };		//Set timeout data 5 second, 0 microsecond
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            s = select(fd + 1, &rfds, NULL, NULL, &tv);				//Waiting new data in VFS from UART0
+            if (s < 0) { ESP_LOGE(UART, "Select failed: errno %d", errno); break; }                          //Failed select data
+			else if (s == 0) { /*ESP_LOGI(UART, "Timeout has been reached and nothing has been received");*/ }   //Timeout, no data
+            else {
+                if (FD_ISSET(fd, &rfds)) {							//Checking file descriptor readiness
+                    if (read(fd, &buf, BUFFER_SIZE) > 0) {	//Reading received data success
+                    	ESP_LOGW(UART, "%s", buf);
+                    	unsigned int error_h;
+                    	if((error_h = handler_command(buf)) == 1) { ESP_LOGI(UART, "OK"); allow(BUZZ_PIN);}	//Call handler commands UART, Result call handler commands UART
+                    	else { if (error_h == 0) { ESP_LOGI(UART, "No command UART"); denied(BUZZ_PIN);} else { ESP_LOGE(UART, "Command failed: error %d", error_h); denied(BUZZ_PIN);} }
+                    }
+					else { ESP_LOGE(UART, "UART read error"); break; }      //Failed reading received data
+				} else { ESP_LOGE(UART, "No FD has been set in select()"); break; }
+            }
+        }
+        close(fd);          //Close UART
+    }
+    vTaskDelete(NULL);
+}
+static void adc1_initialize(void *arg) {
+	vTaskDelay(100 / portTICK_PERIOD_MS);
+	ESP_LOGI(ADC, "Initialization ADC1...");
+    //Configure ADC1 (measurements)
+	esp_err_t ret = adc1_config_width(ADC_WIDTH_BIT_12);
+	if (ret != ESP_OK) {ESP_LOGE(ADC,"Failed configuring width ADC1"); vTaskDelete(NULL);}
+	ret = adc1_config_channel_atten(ch1, ADC_ATTEN_DB_11);
+    if (ret != ESP_OK) {ESP_LOGE(ADC,"Failed configuring ch1 attenuation ADC1"); vTaskDelete(NULL);}
+    //Configure ADC2 (Joystick)
+    ret = adc2_config_channel_atten(ch2, ADC_ATTEN_DB_11);
+	if (ret != ESP_OK) {ESP_LOGE(ADC,"Failed configuring ch2 attenuation ADC2"); vTaskDelete(NULL);}
+	ret = adc2_config_channel_atten(ch3, ADC_ATTEN_DB_11);
+	if (ret != ESP_OK) {ESP_LOGE(ADC,"Failed configuring ch3 attenuation ADC2"); vTaskDelete(NULL);}
+    //Characterize ADC
+    adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
+    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, adc_chars);
+    if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) { ESP_LOGI(ADC,"Characterized using Two Point Value"); }
+    else if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) { ESP_LOGI(ADC,"Characterized using eFuse Vref"); }
+    else { ESP_LOGI(ADC,"Characterized using Default Vref"); }
+    ESP_LOGI(ADC, "Initialization DONE!");
+    vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+	printf("2D_THz_scaner start...\n");
+	mcpwm_event_group = xEventGroupCreate();	//create event group for flags allow mcpwm to go
+	xEventGroupClearBits(mcpwm_event_group, MCPWM_START_BIT);		//clear flag START
+	vSemaphoreCreateBinary(X_step_ok_Semaphore);		//create binary semaphore for ending rotating X mcpwm
+	vSemaphoreCreateBinary(Y_step_ok_Semaphore);		//create binary semaphore for ending rotating Y mcpwm
+	vSemaphoreCreateBinary(Z_step_ok_Semaphore);		//create binary semaphore for ending rotating Z mcpwm
+	if((X_step_ok_Semaphore == NULL)||(Y_step_ok_Semaphore == NULL)||(Z_step_ok_Semaphore == NULL)) { ESP_LOGE(MCPWM_TAG, "Failed to create the queue for capture"); }
+	xSemaphoreTake(X_step_ok_Semaphore, 10 / portTICK_PERIOD_MS);		//testing semaphore X
+	xSemaphoreTake(Y_step_ok_Semaphore, 10 / portTICK_PERIOD_MS);		//testing semaphore Y
+	xSemaphoreTake(Z_step_ok_Semaphore, 10 / portTICK_PERIOD_MS);		//testing semaphore Z
+	cap_queue = xQueueCreate(1, sizeof(capture));		//create queue data for capture signal step mcpwm
+	if(cap_queue == NULL) { ESP_LOGE(MCPWM_TAG, "Failed to create the queue for capture"); }
+	X_step_queue = xQueueCreate(5, sizeof(struct_mcpwm));		//create queue data for number steps X_mcpwm
+	Y_step_queue = xQueueCreate(5, sizeof(struct_mcpwm));		//create queue data for number steps Y_mcpwm
+	Z_step_queue = xQueueCreate(5, sizeof(struct_mcpwm));		//create queue data for number steps Z_mcpwm
+	if((X_step_queue == NULL)||(Y_step_queue == NULL)||(Z_step_queue == NULL)) { ESP_LOGE(MCPWM_TAG, "Failed to create the queue for capture"); }
+	xTaskCreatePinnedToCore(captured_signal_step, "captured_signal_step", 4096, NULL, 4, NULL, 0);	//start task handler for event captured signal
+	vTaskDelay(20 / portTICK_PERIOD_MS);
+	xTaskCreate(mcpwm_config, "mcpwm_config", 4096, NULL, 5, NULL);									//task for initialize mcpwm
+	xTaskCreatePinnedToCore(uart_select_task, "uart_select_task", 4096, NULL, 6, NULL, 0);			//start task uart communication
+	xTaskCreate(adc1_initialize, "adc1_initialize", 4096, NULL, 7, NULL);							//task for initialize adc1
+	succes_process(BUZZ_PIN);
+}
+
